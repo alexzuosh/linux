@@ -197,36 +197,102 @@ Display 引擎是独立固定功能硬件，它直接读 DRAM 的 framebuffer，
 
 ### 3.2.2 `xe_ttm_tt_populate` — 分配物理页面
 
+#### 只针对系统内存，与 VRAM 完全无关
+
+这是理解 TTM 架构最重要的一点：
+
+**`ttm_tt` / `xe_ttm_tt` 对象只存在于系统内存路径（`XE_PL_SYSTEM` / `XE_PL_TT`）。VRAM BO 在 VRAM 中居住时，根本没有 `ttm_tt`，完全通过 `ttm_resource` + VRAM 管理器（buddy allocator）管理。**
+
+```
+BO 在 VRAM 中（XE_PL_VRAM0）:
+  bo->ttm.resource → xe_ttm_vram_mgr_resource
+                       ├── res.mem_type = XE_PL_VRAM0
+                       └── res.start = VRAM 内偏移（buddy allocator 分配）
+  bo->ttm.ttm      → NULL 或 unpopulated
+  物理内存:         LMEM 控制器直接管理，不涉及 CPU 页面
+
+BO 在系统内存中（XE_PL_TT）:
+  bo->ttm.resource → ttm_resource (mem_type = XE_PL_TT)
+  bo->ttm.ttm      → &xe_tt->ttm   ← 这里才有 ttm_tt
+                       ├── tt->pages[]   CPU 物理页数组
+                       └── xe_tt->sg     DMA sg_table（IOVA）
+  物理内存:         普通 DRAM 页面，通过 IOMMU 映射
+```
+
+**两个内存位置的 "backing store" 机制完全不同：**
+
+| 属性 | VRAM（XE_PL_VRAM） | 系统内存（XE_PL_TT） |
+|------|-------------------|---------------------|
+| 物理内存来源 | GDDR/HBM，由 LMEM 控制器管理 | DRAM，由 Linux 页面分配器管理 |
+| TTM 管理结构 | `ttm_resource` + VRAM buddy allocator | `ttm_tt`（`xe_ttm_tt`） |
+| CPU 访问路径 | BAR2 MMIO（`io_mem_reserve`/`io_mem_pfn`） | 普通 kernel 虚拟地址（`kmap`） |
+| GPU 访问路径 | PPGTT PTE → LMEM 地址（直接） | PPGTT PTE → IOVA → IOMMU → PA |
+| `ttm_tt_populate` 调用？ | **从不** | **必须**（才能分配物理页） |
+| DMA 映射？ | **不需要**（GPU 直接访问 LMEM） | **必须**（`xe_tt_map_sg`，建立 IOVA） |
+
+#### populate 的实际调用时机
+
+```
+时机 1: 新建 BO，初始 placement = XE_PL_TT（系统内存）
+  ttm_bo_init_reserved()
+    └─► ttm_tt_create() → xe_ttm_tt_create()     分配 xe_ttm_tt 结构
+    └─► ttm_tt_populate() → xe_ttm_tt_populate() 分配物理页
+
+时机 2: VRAM BO 被驱逐到系统内存（VRAM → TT eviction）
+  xe_bo_move() [驱逐路径]
+    └─►（目标 placement = XE_PL_TT）
+    └─► TTM core 调用 ttm_tt_populate()           分配系统内存物理页
+    └─► xe_bo_move() 中调用 xe_tt_map_sg()        建立 DMA IOVA 映射
+    └─► GPU blit: VRAM 数据 → 系统内存            实际数据搬移
+    └─► 旧 VRAM resource 释放回 buddy allocator
+
+时机 3: swap-in（从磁盘恢复到内存）
+  ttm_tt_restore()                                从 swap 文件恢复页面
+    └─► ttm_pool_alloc()                          分配新物理页
+    └─► 读回磁盘数据
+```
+
+#### 源代码（完整版）
+
 ```c
-static int xe_ttm_tt_populate(struct ttm_device *ttm_dev,
-                               struct ttm_tt *tt,
+// xe_bo.c:554
+static int xe_ttm_tt_populate(struct ttm_device *ttm_dev, struct ttm_tt *tt,
                                struct ttm_operation_ctx *ctx)
 {
-    struct xe_device *xe = ttm_to_xe_device(ttm_dev);
     struct xe_ttm_tt *xe_tt = container_of(tt, struct xe_ttm_tt, ttm);
+    int err;
 
-    // 外部 dmabuf sg BO 不需要 populate
-    if (tt->page_flags & TTM_TT_FLAG_EXTERNAL)
+    /*
+     * dma-bufs 不用 pages 填充，DMA 地址在移动到 XE_PL_TT 时建立。
+     * EXTERNAL_MAPPABLE（普通 sg BO）仍需走 pool_alloc。
+     */
+    if ((tt->page_flags & TTM_TT_FLAG_EXTERNAL) &&
+        !(tt->page_flags & TTM_TT_FLAG_EXTERNAL_MAPPABLE))
         return 0;
 
-    // 通过 TTM 页面池分配物理页（支持 WB/WC/UC 缓存模式）
-    err = ttm_pool_alloc(&ttm_dev->pool, tt, ctx);
+    // swap-in 路径：从磁盘恢复
+    if (ttm_tt_is_backed_up(tt) && !xe_tt->purgeable) {
+        err = ttm_tt_restore(ttm_dev, tt, ctx);
+    } else {
+        // 正常路径：从 TTM 页面池分配物理页
+        ttm_tt_clear_backed_up(tt);
+        err = ttm_pool_alloc(&ttm_dev->pool, tt, ctx);
+    }
     if (err)
         return err;
 
-    // 记录到 shrinker（内存压力时可回收）
-    xe_ttm_tt_account_add(xe, tt);
-
+    xe_tt->purgeable = false;
+    xe_ttm_tt_account_add(ttm_to_xe_device(ttm_dev), tt);  // shrinker 计数
+    update_global_total_pages(ttm_dev, tt->num_pages);      // tracepoint 统计
     return 0;
 }
 ```
 
 `ttm_pool_alloc` 内部逻辑：
 - 优先从页面缓存池取（避免 `alloc_page` 开销）
-- 失败则调用内核页面分配器
-- 按 caching 模式设置 PTE 属性（set_memory_wc 等）
+- 按 `tt->caching`（WB/WC/UC）调用 `set_memory_wc()` 等设置 CPU PTE 属性
 
-> **重要**：`populate` **只分配物理页**，不建立 DMA 映射。DMA 映射由 `xe_bo_move()` 中的 `xe_tt_map_sg()` 负责（在 BO 移动到 `XE_PL_TT` 时调用）。
+> **重要**：`populate` **只分配物理页**，不建立 DMA 映射。DMA 映射（`xe_tt_map_sg`）在 `xe_bo_move()` 将 BO 移入 `XE_PL_TT` 时单独调用。
 
 ### 3.2.2b `xe_tt_map_sg` / `xe_tt_unmap_sg` — DMA 映射生命周期
 
@@ -530,6 +596,298 @@ dma_unmap_sgtable() 时必须 flush IOTLB:
 | IOMMU 关闭 | **全部物理内存**（RC 不过滤） | 无：GPU bug/攻击可读写任意 PA，包括内核内存 |
 
 这也是为何虚拟化和安全敏感场景（Intel VT-d passthrough、AMD-Vi）**必须开启 IOMMU** 的根本原因。
+
+### 3.2.4 VRAM 路径详解：`xe_ttm_vram_mgr`
+
+VRAM 路径完全绕过 `ttm_tt`/`populate`，有一套独立的分配与访问机制。
+
+#### 核心数据结构
+
+```c
+// xe_ttm_vram_mgr_types.h
+
+// ── 管理器（每个 VRAM 区域一个，tile 级别）──────────────────
+struct xe_ttm_vram_mgr {
+    struct ttm_resource_manager manager; // TTM 基类（注册到 ttm_device）
+    struct drm_buddy mm;                 // DRM buddy 分配器（管理 VRAM 地址空间）
+    u64 visible_size;                    // CPU 可见窗口大小（BAR2 io_size）
+    u64 visible_avail;                   // 当前剩余 CPU 可见空间
+    u64 default_page_size;               // 最小分配粒度（通常 PAGE_SIZE = 4K）
+    struct mutex lock;                   // 保护 mm 分配操作
+    u32 mem_type;                        // XE_PL_VRAM0 或 XE_PL_VRAM1
+};
+
+// ── 每个 VRAM BO 的资源描述符 ──────────────────────────────
+struct xe_ttm_vram_mgr_resource {
+    struct ttm_resource base;       // TTM 基类（含 mem_type, start, size）
+    struct list_head blocks;        // DRM buddy block 链表（一个或多个 block）
+    u64 used_visible_size;          // 本 BO 占用的 CPU 可见 VRAM 字节数
+    unsigned long flags;            // DRM_BUDDY_TOPDOWN / DRM_BUDDY_RANGE_ALLOCATION
+};
+```
+
+```c
+// xe_vram_types.h
+
+// ── 物理 VRAM 区域描述（tile 级别，一个 tile 通常一个 VRAM 区域）──
+struct xe_vram_region {
+    resource_size_t io_start;          // PCI BAR2 的 CPU 起始地址（用于 MMIO mmap）
+    resource_size_t io_size;           // BAR2 可映射的 VRAM 字节数（small-BAR 下 < usable_size）
+    resource_size_t dpa_base;          // 设备物理地址（Device Physical Address）基址
+    resource_size_t usable_size;       // VRAM 可用总量（排除内核预留后）
+    resource_size_t actual_physical_size; // VRAM 实际物理大小（含保留）
+    void __iomem *mapping;             // ioremap 后的 CPU 虚拟地址基址
+    struct xe_ttm_vram_mgr ttm;        // 内嵌的 TTM VRAM 管理器
+    u32 placement;                     // XE_PL_VRAM0 / XE_PL_VRAM1
+};
+```
+
+#### VRAM 分配路径：`xe_ttm_vram_mgr_new`
+
+当 TTM core 需要为 BO 在 VRAM 中分配空间时，调用 `man->func->alloc()`，即 `xe_ttm_vram_mgr_new()`：
+
+```c
+// xe_ttm_vram_mgr.c:49
+static int xe_ttm_vram_mgr_new(struct ttm_resource_manager *man,
+                                struct ttm_buffer_object *tbo,
+                                const struct ttm_place *place,
+                                struct ttm_resource **res)
+{
+    struct xe_ttm_vram_mgr *mgr = to_xe_ttm_vram_mgr(man);
+    struct xe_ttm_vram_mgr_resource *vres;
+    struct drm_buddy *mm = &mgr->mm;
+    u64 size, min_page_size;
+    unsigned long lpfn;
+
+    // ① 确定分配上界（lpfn = 0 表示全 VRAM）
+    lpfn = place->lpfn ?: man->size >> PAGE_SHIFT;
+
+    // ② 分配 vres 资源描述符
+    vres = kzalloc(sizeof(*vres), GFP_KERNEL);
+    ttm_resource_init(tbo, place, &vres->base);  // 填充 mem_type、size 等基类字段
+    INIT_LIST_HEAD(&vres->blocks);
+
+    // ③ 设置 buddy 分配标志
+    if (place->flags & TTM_PL_FLAG_TOPDOWN)
+        vres->flags |= DRM_BUDDY_TOPDOWN_ALLOCATION;  // 从高地址往低分（BAR 外空间）
+    if (place->fpfn || lpfn != man->size >> PAGE_SHIFT)
+        vres->flags |= DRM_BUDDY_RANGE_ALLOCATION;    // 限定地址范围
+
+    // ④ CONTIGUOUS 特殊处理：对齐到 2^n 以满足连续要求
+    if (place->flags & TTM_PL_FLAG_CONTIGUOUS) {
+        size = roundup_pow_of_two(size);
+        min_page_size = size;
+        lpfn = max_t(unsigned long, place->fpfn + (size >> PAGE_SHIFT), lpfn);
+    }
+
+    // ⑤ 核心：buddy 分配器分配 VRAM 地址块
+    mutex_lock(&mgr->lock);
+    err = drm_buddy_alloc_blocks(mm,
+                                  (u64)place->fpfn << PAGE_SHIFT,  // 分配范围下界
+                                  (u64)lpfn << PAGE_SHIFT,         // 分配范围上界
+                                  size,
+                                  min_page_size,
+                                  &vres->blocks,                   // 输出：block 链表
+                                  vres->flags);
+
+    // ⑥ 统计 CPU 可见使用量（用于 visible_avail 跟踪）
+    mgr->visible_avail -= vres->used_visible_size;
+    mutex_unlock(&mgr->lock);
+
+    // ⑦ 设置 vres->base.start（BO 在 VRAM 中的偏移，PAGE 单位）
+    //    仅连续分配才有有效 start；非连续 start = XE_BO_INVALID_OFFSET
+    if (vres->base.placement & TTM_PL_FLAG_CONTIGUOUS) {
+        struct drm_buddy_block *block = list_first_entry(&vres->blocks, ...);
+        vres->base.start = drm_buddy_block_offset(block) >> PAGE_SHIFT;
+    } else {
+        vres->base.start = XE_BO_INVALID_OFFSET;
+    }
+
+    *res = &vres->base;
+    return 0;
+}
+```
+
+#### DRM Buddy 分配器：VRAM 地址空间管理
+
+```
+VRAM 物理地址空间（例：8 GiB VRAM）:
+┌──────────────────────────────────────────────────────────────────┐
+│                    drm_buddy（mm）                               │
+│                                                                  │
+│  [0 ── 256 MiB)  CPU 可见范围（BAR2 small-BAR 情形）             │
+│  │                                                               │
+│  ├── Block A: 0x0000_0000 ─ 0x0FFF_FFFF (256 MiB, free)        │
+│                                                                  │
+│  [256 MiB ── 8 GiB)  CPU 不可见区域（仅 GPU 可访问）             │
+│  │                                                               │
+│  ├── Block B: 0x1000_0000 ─ 0x1FFF_FFFF (256 MiB, allocated)   │
+│  ├── Block C: 0x2000_0000 ─ 0x3FFF_FFFF (512 MiB, free)        │
+│  └── ...                                                         │
+└──────────────────────────────────────────────────────────────────┘
+
+drm_buddy_alloc_blocks() 返回一个或多个 drm_buddy_block，
+每个 block 描述一段连续的 VRAM 地址范围。
+非连续分配时，vres->blocks 链表含多个 block。
+```
+
+`drm_buddy` 是 2^n 的 buddy 分配器，关键特性：
+- 分配的 block 大小是 `min_page_size` 的 2^n 倍
+- `TOPDOWN` flag：从高地址往低分，优先将低地址（BAR 可见区域）留给需要 CPU 访问的 BO
+- `RANGE` flag：强制在 `[fpfn, lpfn)` 范围内分配（用于 small-BAR 中把 scanout BO 限制在 BAR 内）
+
+#### small-BAR vs rBAR：`visible_size` 对 BO 放置的影响
+
+```
+small-BAR（常见笔记本 dGPU，BAR2 = 256 MiB，VRAM = 4 GiB）:
+  xe_vram_region:
+    io_size     = 256 MiB   ← BAR2 实际窗口大小
+    usable_size = 4 GiB     ← 全部 VRAM 可用空间
+  xe_ttm_vram_mgr:
+    visible_size = 256 MiB
+    mm.size      = 4 GiB
+
+  需要 CPU 访问的 BO（如 framebuffer）→ place.lpfn = 256M >> PAGE_SHIFT
+    → xe_ttm_vram_mgr_new 将其限制在 [0, 256M) 范围内
+    → io_mem_reserve 能设置有效 bus.offset（在 BAR2 内）
+
+  不需要 CPU 访问的 BO（如 shader、texture）→ place.lpfn = 0（全 VRAM）
+    + TTM_PL_FLAG_TOPDOWN → 优先分配 BAR 外空间（节省 CPU 可见带宽）
+
+rBAR（PCIe Resizable BAR，BAR2 = 4 GiB = VRAM 全量）:
+  io_size == usable_size → visible_size = 4 GiB
+  → 所有 BO 都在 BAR 内，CPU 可访问任意 VRAM 地址
+  → TOPDOWN / lpfn 限制仍存在于 xe_place_helper，但不再实际压缩空间
+```
+
+#### GPU 如何访问 VRAM：PPGTT PTE 直接写 LMEM 地址
+
+VRAM BO 在 PPGTT 中的 PTE 直接使用 LMEM 物理地址（DPA，Device Physical Address），**无需 IOMMU**：
+
+```c
+// xe_res_cursor.h — 遍历 VRAM buddy blocks 时提取地址
+static inline u64 xe_res_dma(const struct xe_res_cursor *cur)
+{
+    // VRAM 路径：start 是 drm_buddy_block_offset（VRAM 内偏移）
+    // 无 sgl，直接用 cur->start（buddy block 的 VRAM 偏移）
+    return cur->start;  // 对于 VRAM，这就是 LMEM 物理地址（相对于 dpa_base）
+}
+
+// PTE 构建（xe_pt.c）：
+u64 lmem_addr = xe_res_dma(&cur) + vram->dpa_base; // VRAM 物理绝对地址
+u64 pte = lmem_addr | PAT_INDEX_VRAM | XE_PTE_PRESENT;
+// 写入 PPGTT 页表
+
+// GPU 执行时的完整路径（无 IOMMU 介入）：
+// GPU VA → PPGTT PTE → LMEM DPA → LMEM 控制器 → GDDR/HBM
+```
+
+对比系统内存路径（有 IOMMU）：
+
+```
+系统内存: GPU VA → PPGTT → IOVA → [IOMMU 翻译] → PA → Memory Controller
+VRAM:     GPU VA → PPGTT → LMEM DPA            → LMEM Controller (直达)
+```
+
+#### CPU 如何访问 VRAM：BAR2 MMIO 路径
+
+CPU **不能**直接用普通虚拟地址访问 VRAM（VRAM 不在 CPU 的物理地址空间内），必须通过 BAR2 窗口：
+
+```c
+// xe_ttm_io_mem_reserve() — 当 TTM 需要 CPU mmap VRAM BO 时调用
+case XE_PL_VRAM0: {
+    struct xe_vram_region *vram = res_to_mem_region(mem);
+
+    // VRAM BO 在 BAR2 中的 CPU 物理地址：
+    // bus.offset = BAR2 基地址（io_start）+ BO 在 VRAM 内偏移（start << PAGE_SHIFT）
+    mem->bus.offset = vram->io_start + ((u64)mem->start << PAGE_SHIFT);
+    mem->bus.is_iomem = true;
+    mem->bus.caching = ttm_write_combined;  // ← CPU 必须用 WC（无 PCIe snoop）
+    return 0;
+}
+```
+
+用户态 mmap 流程（小 BAR 下 BO 必须在 CPU 可见 256MiB 内）：
+
+```
+mmap(drm_fd, offset=mmo.offset) 触发缺页 →
+  ttm_bo_vm_fault() →
+    xe_ttm_io_mem_pfn() 返回 BAR2 PFN →
+      remap_pfn_range(..., pgprot_writecombine(pgprot)) →
+        CPU VA → BAR2 PFN （WC 模式，写入直达 VRAM）
+```
+
+#### VRAM DMA-buf 导出：`xe_ttm_vram_mgr_alloc_sgt`
+
+当 VRAM BO 需要通过 DMA-buf 导出给其他设备（如 CPU encode，外部 DMA）时，需要临时建立 DMA 映射。此时使用 `dma_map_resource()`（而非 `dma_map_sgtable()`），直接映射 PCI BAR 物理范围：
+
+```c
+// xe_ttm_vram_mgr.c:370
+// 遍历 vres->blocks，为每个 buddy block 建立 DMA 映射
+xe_res_first(res, offset, length, &cursor);
+for_each_sgtable_sg((*sgt), sg, i) {
+    // phys = buddy block 在 VRAM 中的偏移 + BAR2 io_start（PCI 物理地址）
+    phys_addr_t phys = cursor.start + xe_vram_region_io_start(tile->mem.vram);
+
+    // 直接映射 PCI BAR 物理地址范围（不是系统内存页面）
+    addr = dma_map_resource(dev, phys, size, dir, DMA_ATTR_SKIP_CPU_SYNC);
+    sg_dma_address(sg) = addr;
+}
+```
+
+注意：这种 DMA 映射要求 BO 在 CPU 可见 VRAM 区域内（`vres->used_visible_size == res->size`），否则返回 `-EOPNOTSUPP`。
+
+#### VRAM 完整路径流程图
+
+```mermaid
+sequenceDiagram
+    participant APP as 用户态
+    participant DRM as DRM/GEM
+    participant TTM as TTM Core
+    participant VMGR as xe_ttm_vram_mgr
+    participant BUDDY as drm_buddy
+    participant HW as GPU/LMEM 控制器
+
+    Note over APP,HW: VRAM BO 创建路径
+    APP->>DRM: DRM_IOCTL_XE_GEM_CREATE (XE_GEM_CREATE_FLAG_DEFER_BACKING 未设时)
+    DRM->>TTM: ttm_bo_init_reserved()
+    TTM->>VMGR: man->func->alloc() = xe_ttm_vram_mgr_new()
+    VMGR->>BUDDY: drm_buddy_alloc_blocks(mm, fpfn, lpfn, size)
+    BUDDY-->>VMGR: vres->blocks（VRAM 地址范围链表）
+    VMGR-->>TTM: &vres->base（ttm_resource，含 start = VRAM 偏移）
+    Note over TTM: bo->ttm.ttm = NULL（无 ttm_tt！）
+    TTM->>TTM: ttm_bo_move_null()（VRAM BO 创建时无需搬移）
+
+    Note over APP,HW: GPU VM_BIND（PPGTT 建立）
+    APP->>DRM: DRM_IOCTL_XE_VM_BIND
+    DRM->>HW: 构建 PPGTT PTE: addr = drm_buddy_block_offset + dpa_base
+    Note over HW: GPU 执行：GPU VA → PPGTT → LMEM DPA → GDDR/HBM
+
+    Note over APP,HW: CPU mmap（仅 CPU 可见 VRAM）
+    APP->>DRM: DRM_IOCTL_XE_GEM_MMAP_OFFSET
+    APP->>DRM: mmap(drm_fd, mmo.offset)
+    DRM->>TTM: ttm_bo_vm_fault()
+    TTM->>VMGR: xe_ttm_io_mem_reserve() → bus.offset = io_start + start<<PAGE_SHIFT
+    TTM->>APP: remap_pfn_range(WC) → CPU VA → BAR2 MMIO
+
+    Note over APP,HW: VRAM BO 驱逐（VRAM→TT）
+    TTM->>TTM: ttm_tt_populate() → 分配系统内存物理页
+    TTM->>TTM: xe_bo_move() → GPU blit: LMEM → DRAM
+    VMGR->>BUDDY: drm_buddy_free_list() → 释放 VRAM 地址块
+```
+
+#### 关键差异汇总
+
+| 属性 | 系统内存（XE_PL_TT） | VRAM（XE_PL_VRAM） |
+|------|---------------------|-------------------|
+| 物理内存分配 | `ttm_pool_alloc()`→ Linux page allocator | `drm_buddy_alloc_blocks()` → LMEM buddy |
+| TTM 资源结构 | `ttm_tt` (`xe_ttm_tt`) | `ttm_resource` (`xe_ttm_vram_mgr_resource`) |
+| GPU 地址翻译 | PPGTT → IOVA → IOMMU → PA | PPGTT → LMEM DPA（直达，无 IOMMU） |
+| CPU 访问方式 | 普通 kmap/mmap（MMU 翻译） | BAR2 MMIO（WC，`ioremap_wc`） |
+| CPU caching | WB 或 WC（由 `ttm_tt.caching` 决定） | **始终 WC**（无 PCIe snoop 到 VRAM） |
+| 需要 DMA 映射？ | **是**（`xe_tt_map_sg` / IOMMU） | **否**（GPU 直读 LMEM；DMA-buf 导出例外） |
+| 释放操作 | `ttm_pool_free()` + DMA unmap | `drm_buddy_free_list()` |
+| 可否超过 BAR 大小？ | 无关（系统 DRAM） | 是（CPU 不可见部分），GPU 仍可访问 |
 
 ### 3.2.3 `xe_ttm_tt_unpopulate` — 释放物理页面
 
