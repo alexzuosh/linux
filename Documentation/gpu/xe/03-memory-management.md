@@ -633,7 +633,274 @@ echo "1" > /proc/sys/kernel/gpu_trace_memory
 cat /sys/kernel/debug/tracing/trace
 ```
 
-## 8. Common Memory Issues & Solutions
+## 8. PAT Index & Cache Coherency Model
+
+### Why Coherency Matters
+
+Every GPU VMA binding carries a `pat_index` that is encoded directly into the
+ppGTT page-table entry.  The PAT (Page Attribute Table) index controls caching
+policy and, on modern Xe hardware, an explicit cache-coherency mode.  Choosing
+the wrong coherency mode silently corrupts GPU reads; the GPU reads stale data
+from DRAM even when the CPU has dirty (modified) cache lines for the same
+physical address.
+
+The driver extracts the coherency mode with `xe_pat_index_get_coh_mode()` and
+enforces the rules below at VM-bind time in `vm_bind_ioctl_check_args()` and
+`xe_vm_bind_ioctl_validate_bo()`.
+
+---
+
+### Hardware Coherency Topology
+
+The fundamental difference between iGPU and dGPU is whether the CPU and GPU
+share a last-level cache (LLC).
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        iGPU (MTL / LNL)                           │
+│                                                                    │
+│   ┌──────────┐   ┌──────────┐     ┌──────────────────────────┐   │
+│   │  CPU     │   │  CPU     │     │    GPU EU Cluster        │   │
+│   │  Core 0  │   │  Core N  │     │    (Render / Compute)    │   │
+│   └────┬─────┘   └────┬─────┘     └────────────┬─────────────┘   │
+│        └──────┬────────┘                        │                 │
+│           ┌───▼──────────────────────────────────▼────────┐       │
+│           │            Unified LLC (shared)               │       │
+│           │  CPU stores and GPU stores are immediately    │       │
+│           │  visible to the other side — 2-WAY coherency │       │
+│           └───────────────────┬──────────────────────────┘       │
+│                               │  LPDDR / DDR (SYSMEM)            │
+└───────────────────────────────┼────────────────────────────────────┘
+                                │
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    dGPU (DG2 / BMG / PVC)                          │
+│                                                                     │
+│  CPU DIE                                dGPU                       │
+│  ┌──────────┐   ┌──────────┐           ┌─────────────────────────┐ │
+│  │  Core 0  │   │  Core N  │           │   GPU L3 (private)      │ │
+│  └────┬─────┘   └────┬─────┘           │   NOT accessible to CPU │ │
+│       └──────┬────────┘                └──────────┬──────────────┘ │
+│          ┌───▼──────────┐                         │                │
+│          │  CPU LLC     │◄──── Snooped read ──────┘  1-WAY only:  │
+│          │  (CPU-only)  │      (PCIe TLP NS=0)    GPU→CPU snoop ✓ │
+│          └───────┬──────┘                         CPU→GPU snoop ✗ │
+│                  │ DDR (SYSMEM)                                    │
+│                  │                                                 │
+│                  │     PCIe x16         ┌─────────────────────┐   │
+│                  └─────────────────────►│  LMEM (GDDR6/HBM)  │   │
+│                     BAR2 window (WC)    │  behind BAR2        │   │
+│                     pgprot_writecombine └─────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Three Coherency Scenarios in Detail
+
+#### Scenario 1: dGPU LMEM — Write-Combining, No Coherency
+
+LMEM (VRAM) sits behind the PCIe **BAR2** aperture.  When the CPU maps LMEM via
+`mmap()` the driver sets **`pgprot_writecombine()`** on the VMA:
+
+```c
+/* xe_device.c — xe_gem_mmap */
+if (xe_bo_is_vram(bo) || xe_bo_is_stolen_devmem(bo)) {
+    vma->vm_page_prot =
+        pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+    vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+}
+```
+
+What this means at the hardware level:
+
+```
+CPU write to LMEM via BAR2 (WC mode):
+  CPU Core ──store──► 64-byte WC write buffer
+                           │
+                    (accumulates writes until
+                     buffer is full or sfence)
+                           │
+              PCIe MWr TLP ──────────────► LMEM (direct)
+                            No CPU LLC involvement at all.
+
+CPU read from LMEM via BAR2 (WC mode):
+  CPU Core ──load──► PCIe MRd TLP ──────► LMEM
+                     (latency ~1–5 µs)
+                     No prefetch, no caching.
+                     Reads are slow on purpose.
+```
+
+Because the CPU LLC never caches the BAR2 range:
+- there are no dirty lines in the CPU LLC for LMEM addresses;
+- therefore the GPU does not need to snoop the CPU when reading LMEM;
+- PAT entry for LMEM BOs correctly carries **`XE_COH_NONE`**.
+
+Attempting to map LMEM with WB (`pgprot_cached`) would be **incorrect**:
+the CPU would cache LMEM pages in its LLC, but the GPU reads LMEM directly and
+would see stale DRAM contents rather than the CPU's dirty cache lines.
+
+---
+
+#### Scenario 2: dGPU SYSMEM — 1-Way Coherency (GPU Snoops CPU LLC)
+
+SYSMEM (ordinary DDR on the host) is accessible to both the CPU via its memory
+controller and to the GPU via PCIe DMA.
+
+For SYSMEM BOs created with `DRM_XE_GEM_CPU_CACHING_WB`, the CPU maps the
+pages with WB protection — the CPU LLC *can and will* cache them.  When the GPU
+reads those pages afterward it must issue a **snooped PCIe read**
+(`TLP No-Snoop bit = 0`).  The PCIe root complex then:
+
+```
+GPU DMA read of SYSMEM (snooped, TLP NS=0):
+
+  GPU DMA engine ──MRd(NS=0)──► PCIe Root Complex
+                                        │
+                               ┌────────▼────────────┐
+                               │  CPU LLC Snoop      │
+                               │  Filter             │
+                               └────────┬────────────┘
+                                        │
+                       Cache HIT (CPU has dirty line):
+                           returns dirty data to GPU  ✔
+                                        │
+                       Cache MISS:
+                           reads from DRAM            ✔
+
+Result: GPU always reads the latest data, even when
+        the CPU has not yet written back to DRAM.
+```
+
+This is called **1-way coherency** because the snoop is one-directional:
+
+- **GPU → CPU snoop**: ✔ possible via PCIe TLP No-Snoop=0 reads.
+- **CPU → GPU snoop**: ✗ impossible — PCIe defines no H2D snoop-request TLP;
+  the CPU has no hardware path to probe or invalidate lines in the GPU's
+  private L3 cache.
+
+If instead the GPU used a non-snooped read (`TLP NS=1`) on a WB-cached SYSMEM
+BO, it would bypass the CPU LLC and read potentially stale DRAM — **silent data
+corruption**.  This is why the driver rejects the combination of
+`DRM_XE_GEM_CPU_CACHING_WB` and `XE_COH_NONE` at bind time.
+
+CXL Type-2 (CXL.cache + CXL.mem) would enable full 2-way coherency on discrete
+accelerators by adding H2D snoop channels, but current Xe dGPU products connect
+over plain PCIe.
+
+---
+
+#### Scenario 3: iGPU SYSMEM — 2-Way Coherency
+
+On integrated GPU platforms (MTL/LNL) the CPU and GPU share the same LLC (or
+are connected via a low-latency on-package fabric).  Both sides can probe and
+invalidate each other's cache lines without any PCIe round-trips.
+
+PAT entries with `XELPG_3_COH_2W` (MTL) or `XE2 coh_mode=3` (LNL) enable this
+full 2-way coherency.  The driver maps both 1-way and 2-way hardware entries to
+`XE_COH_AT_LEAST_1WAY` since 1-way is a strict subset of 2-way coherency.
+
+---
+
+### PAT Table Coherency Encoding Per Platform
+
+| Platform | Type | Memory | PAT field | `coh_mode` | CPU caching |
+|---|---|---|---|---|---|
+| DG2 (Xe-HPG) | dGPU | LMEM/BAR2 | XELP `WC` | `XE_COH_NONE` | WC only |
+| DG2 (Xe-HPG) | dGPU | SYSMEM | XELP `WB` | `XE_COH_AT_LEAST_1WAY` | WB |
+| PVC (Xe-HPC) | dGPU | LMEM/BAR2 | XELP `WC` | `XE_COH_NONE` | WC only |
+| PVC (Xe-HPC) | dGPU | SYSMEM | XELP `WB` | `XE_COH_AT_LEAST_1WAY` | WB |
+| MTL (Xe-LPM+) | iGPU | SYSMEM | `WB\|COH_2W` | `XE_COH_AT_LEAST_1WAY` | WB |
+| MTL (Xe-LPM+) | iGPU | SYSMEM | `WB\|COH_1W` | `XE_COH_AT_LEAST_1WAY` | WB |
+| LNL (Xe2-LPM) | iGPU | SYSMEM | `XE2 coh=3` | `XE_COH_AT_LEAST_1WAY` | WB |
+| BMG (Xe2-HPG) | dGPU | LMEM/BAR2 | `XE2 coh=0` | `XE_COH_NONE` | WC only |
+| BMG (Xe2-HPG) | dGPU | SYSMEM | `XE2 coh=2` | `XE_COH_AT_LEAST_1WAY` | WB |
+
+---
+
+### Coherency Enforcement at VM-Bind
+
+The driver enforces these rules at bind time before any page-table entry is
+written.  There are two enforcement sites:
+
+#### `vm_bind_ioctl_check_args()` — global per-operation checks
+
+```c
+/* xe_vm.c */
+coh_mode = xe_pat_index_get_coh_mode(xe, pat_index);
+
+/* 1. coh_mode == 0: hardware-reserved PAT entry */
+if (XE_IOCTL_DBG(xe, !coh_mode))
+    return -EINVAL;
+
+/* 2. coh_mode > 1-way on a dGPU PAT table: driver bug */
+if (XE_WARN_ON(coh_mode > XE_COH_AT_LEAST_1WAY))
+    return -EINVAL;
+
+/* 3. MAP_USERPTR needs at least 1-way: CPU has WB-cached the pages */
+if (XE_IOCTL_DBG(xe, coh_mode == XE_COH_NONE &&
+                 op == DRM_XE_VM_BIND_OP_MAP_USERPTR))
+    return -EINVAL;
+```
+
+#### `xe_vm_bind_ioctl_validate_bo()` — per-BO coherency contract
+
+```c
+/* xe_vm.c */
+coh_mode = xe_pat_index_get_coh_mode(xe, pat_index);
+
+if (bo->cpu_caching) {
+    /*
+     * WB-cached BO requires GPU snooped reads (XE_COH_AT_LEAST_1WAY).
+     * XE_COH_NONE with WB cpu_caching → GPU reads stale DRAM data.
+     */
+    if (XE_IOCTL_DBG(xe, coh_mode == XE_COH_NONE &&
+                     bo->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB))
+        return -EINVAL;
+} else {
+    /* Imported dma-buf: unknown CPU caching; require at least 1-way. */
+    if (XE_IOCTL_DBG(xe, coh_mode == XE_COH_NONE))
+        return -EINVAL;
+}
+```
+
+---
+
+### PCIe TLP No-Snoop Bit Summary
+
+```
+PCIe Read TLP Header (simplified, 3-DW):
+┌────┬──┬───────────────────────────────────────────┐
+│ TD │NS│            Address (64-bit)               │
+└────┴──┴───────────────────────────────────────────┘
+      │
+      ├─ NS=0: SNOOPED read
+      │        Root complex checks CPU LLC snoop filter.
+      │        On hit → returns dirty cache line to GPU.
+      │        On miss → fetches from DRAM.
+      │        → Required for XE_COH_AT_LEAST_1WAY
+      │
+      └─ NS=1: NO-SNOOP read
+               Root complex goes directly to DRAM.
+               Ignores any dirty lines in CPU LLC.
+               → Used for XE_COH_NONE (LMEM, WC-only BOs)
+```
+
+---
+
+### Key Source Files
+
+| File | Role |
+|---|---|
+| `drivers/gpu/drm/xe/xe_pat.c` | PAT table definitions per platform; `xe_pat_index_get_coh_mode()` |
+| `drivers/gpu/drm/xe/xe_pat.h` | `XE_COH_NONE` / `XE_COH_AT_LEAST_1WAY` defines |
+| `drivers/gpu/drm/xe/xe_vm.c` | Coherency enforcement at VM-bind ioctl |
+| `drivers/gpu/drm/xe/xe_bo.c` | BO allocation; `cpu_caching` field |
+| `include/uapi/drm/xe_drm.h` | `DRM_XE_GEM_CPU_CACHING_WB/WC`; `pat_index` in bind op |
+
+---
+
+## 9. Common Memory Issues & Solutions
 
 | Issue | Symptom | Cause | Solution |
 |-------|---------|-------|----------|
@@ -662,6 +929,12 @@ The Xe memory management system provides:
    - Per-tile resource
 
 This three-layer design provides security (per-VM isolation), flexibility (BO placement), and efficiency (lazy allocation, automatic eviction).
+
+4. **PAT Index & Coherency** - Per-VMA cache attribute and coherency contract
+   - `XE_COH_NONE` for dGPU LMEM (WC BAR2 mapping, no LLC involvement)
+   - `XE_COH_AT_LEAST_1WAY` for SYSMEM WB-cached BOs (GPU snoops CPU LLC)
+   - `XE_COH_AT_LEAST_1WAY` covers both 1-way (dGPU PCIe) and 2-way (iGPU shared LLC)
+   - Enforced at bind time before any PTE is written
 
 ---
 
