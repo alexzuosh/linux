@@ -505,7 +505,280 @@ sequenceDiagram
 
 ---
 
-## 7.7 内存区域物理布局总图
+## 7.7 TTM 如何统一追踪所有 BO
+
+这是 TTM 内存管理的**控制平面核心**——不论 BO 在系统内存还是 VRAM，TTM 用同一套基础设施追踪它们的位置、驱逐顺序和空间使用量。
+
+### 7.7.1 两个核心索引结构
+
+#### ① `bdev->man_drv[]`：mem_type → manager 的全局路由表
+
+```c
+// include/drm/ttm/ttm_device.h
+struct ttm_device {
+    struct ttm_resource_manager *man_drv[TTM_NUM_MEM_TYPES];  // 9 个槽
+    spinlock_t lru_lock;          // 保护所有 manager 的 LRU 列表
+    struct list_head unevictable; // 已 pin 或 swap-out 的 BO 专用链表
+    struct ttm_pool pool;         // 系统内存页面池（WB/WC/UC 分类缓存）
+    ...
+};
+```
+
+`man_drv[]` 是一个固定大小数组，下标即 `mem_type`，值是指向对应管理器的指针。查找某 mem_type 的管理器是 O(1)：
+
+```c
+static inline struct ttm_resource_manager *
+ttm_manager_type(struct ttm_device *bdev, int mem_type)
+{
+    return bdev->man_drv[mem_type];   // 直接数组下标，无锁
+}
+```
+
+Xe 的注册关系：
+
+```
+man_drv[XE_PL_SYSTEM(0)] → (bdev 内置 sysman，TTM 默认处理)
+man_drv[XE_PL_TT(1)]     → xe_ttm_sys_mgr   (xe_ttm_sys_mgr_init)
+man_drv[XE_PL_VRAM0(2)]  → xe_ttm_vram_mgr  (tile 0)
+man_drv[XE_PL_VRAM1(3)]  → xe_ttm_vram_mgr  (tile 1)
+man_drv[XE_PL_STOLEN(8)] → xe_ttm_stolen_mgr
+```
+
+#### ② `man->lru[]`：每个 manager 维护 4 条按优先级分级的 LRU 链表
+
+```c
+// include/drm/ttm/ttm_resource.h
+struct ttm_resource_manager {
+    struct list_head lru[TTM_MAX_BO_PRIORITY];  // 4 条链表（优先级 0-3）
+    uint64_t usage;                              // 已分配字节数（受 lru_lock 保护）
+    ...
+};
+
+#define TTM_MAX_BO_PRIORITY  4U
+```
+
+每个 `ttm_resource`（每个 BO 的 per-placement 资源描述符）内嵌一个 `ttm_lru_item`：
+
+```c
+// include/drm/ttm/ttm_resource.h
+struct ttm_resource {
+    unsigned long start;       // VRAM 内偏移（PFN 单位）或 INVALID_OFFSET
+    size_t size;               // 字节数
+    uint32_t mem_type;         // XE_PL_SYSTEM / XE_PL_TT / XE_PL_VRAM0 ...
+    uint32_t placement;        // TTM_PL_FLAG_* 标志
+    struct ttm_bus_placement bus; // CPU mmap 用（BAR offset 等）
+    struct ttm_buffer_object *bo; // 反向指针（受 lru_lock 保护）
+    struct ttm_lru_item lru;   // ← 链入 man->lru[priority] 的节点
+};
+```
+
+### 7.7.2 LRU 链表的完整拓扑
+
+```
+ttm_device (xe->ttm)
+│
+├── lru_lock (spinlock)  ← 保护下面所有 LRU 相关操作
+│
+├── unevictable (list_head)
+│     ├── res[pinned BO A].lru.link
+│     └── res[swapped BO B].lru.link
+│
+└── man_drv[]
+      │
+      ├── [XE_PL_TT] = xe_ttm_sys_mgr
+      │     ├── usage = 3 GiB（当前 TT 已分配量）
+      │     ├── lru[0] (priority 0 - 最低优先级，最先被驱逐)
+      │     │     ├── res[普通用户 BO 1].lru.link
+      │     │     ├── res[普通用户 BO 2].lru.link
+      │     │     └── ...
+      │     ├── lru[1]
+      │     │     └── res[内核内部 BO].lru.link
+      │     ├── lru[2]
+      │     └── lru[3] (priority 3 - 最高优先级，最后被驱逐)
+      │           └── res[关键 BO].lru.link
+      │
+      └── [XE_PL_VRAM0] = xe_ttm_vram_mgr
+            ├── mm (drm_buddy，管理 VRAM 物理地址空间)
+            ├── usage = 5 GiB
+            ├── lru[0]
+            │     ├── res[用户纹理 BO 1].lru.link
+            │     ├── res[用户纹理 BO 2].lru.link
+            │     └── ...
+            ├── lru[1]
+            ├── lru[2]
+            └── lru[3]
+                  └── res[显存中的 GuC BO].lru.link
+```
+
+**关键设计**：`ttm_resource` 是所有路径（VRAM、系统内存、stolen）的统一抽象。不论底层物理内存来自 `drm_buddy` 还是页面分配器，它们都通过同一个 `lru.link` 节点链入各自 manager 的 LRU 链表，受同一把 `bdev->lru_lock` 保护。
+
+### 7.7.3 BO 在 LRU 中的生命周期
+
+```
+BO 创建，ttm_resource_alloc():
+  → man->func->alloc() 分配物理空间（buddy/page pool）
+  → ttm_resource_init() 初始化 ttm_resource 基类
+  → spin_lock(bdev->lru_lock)
+      list_add_tail(&res->lru.link, &man->lru[bo->priority])  ← 入队 LRU 尾部
+      man->usage += res->size                                   ← 更新使用量统计
+  → spin_unlock(bdev->lru_lock)
+
+BO 被使用（VM_BIND / exec queue 提交后）:
+  → [可选] ttm_resource_move_to_lru_tail()
+      spin_lock → list_move_tail(&res->lru.link, ...) → 移到队尾（最近最用）
+
+BO 被 pin（xe_bo_pin）:
+  → spin_lock(bdev->lru_lock)
+      list_move(&res->lru.link, &bdev->unevictable)  ← 移出 manager LRU
+  → spin_unlock
+
+驱逐扫描（内存压力）:
+  → ttm_resource_manager_for_each_res(cursor, res):
+      从 man->lru[0] 头部开始扫描（最近最少用 = 驱逐首选）
+      → ttm_bo_eviction_valuable() 检查是否值得驱逐
+      → 预留（ww_mutex_trylock）
+      → xe_bo_move() 搬移数据 → 更新 res->mem_type → 更新 LRU 链表
+
+BO 销毁，ttm_resource_free():
+  → spin_lock(bdev->lru_lock)
+      list_del_init(&res->lru.link)  ← 从 LRU 移除
+      man->usage -= res->size         ← 释放使用量
+  → spin_unlock
+  → man->func->free() 释放物理空间（drm_buddy_free / 页面返池）
+```
+
+### 7.7.4 `usage` 字段：每个 manager 的空间使用量追踪
+
+`man->usage` 是驱逐决策的快速路径检查依据：
+
+```c
+// TTM core 在 bo_validate 中:
+if (ttm_resource_manager_usage(man) > man->size) {
+    // 空间不足，触发驱逐
+    ret = ttm_mem_evict_first(bdev, man, place, ctx, bulk);
+}
+
+uint64_t ttm_resource_manager_usage(struct ttm_resource_manager *man)
+{
+    // 受 lru_lock 保护，原子读
+    return man->usage;
+}
+```
+
+对于 VRAM（`xe_ttm_vram_mgr`），除了 `man->usage` 之外还额外跟踪 `visible_avail`（CPU 可见 VRAM 剩余量），用于 small-BAR 下决定 BO 是否能放入 BAR 可见区域。
+
+### 7.7.5 多 BO 批量 LRU 操作：`ttm_lru_bulk_move`
+
+相关联的 BO 组（如一个 VM 的所有页表 BO）应该作为一个整体被驱逐，而不是单独被扫描到。`ttm_lru_bulk_move` 实现了这个分组机制：
+
+```c
+// include/drm/ttm/ttm_resource.h
+struct ttm_lru_bulk_move {
+    // pos[mem_type][priority]: 当前组在各 LRU 链表中的 [first, last] 范围
+    struct ttm_lru_bulk_move_pos pos[TTM_NUM_MEM_TYPES][TTM_MAX_BO_PRIORITY];
+    struct list_head cursor_list;  // 正在遍历此组的 cursor 链表
+};
+```
+
+使用方式（Xe 页表 BO 场景）：
+
+```c
+// xe_vm.c 中，批量管理 VM 所有页表 BO 的 LRU 位置
+struct ttm_lru_bulk_move bulk;
+ttm_lru_bulk_move_init(&bulk);
+
+xe_bo_set_bulk_move(bo, &bulk);   // 加入批量组
+
+// 操作完成后，将所有相关 BO 一起移到 LRU 尾部
+ttm_lru_bulk_move_tail(&bulk);    // 原子地把整个组移到队尾
+
+// 清理
+ttm_lru_bulk_move_fini(&xe->ttm, &bulk);
+```
+
+驱逐时，TTM 遇到批量组中的任何一个 BO，都会尝试锁定整个 `dma_resv`（所有组内 BO 共享同一个 resv），从而实现组级别的原子驱逐。
+
+### 7.7.6 `ttm_resource_manager_for_each_res`：驱逐扫描迭代器
+
+```c
+// include/drm/ttm/ttm_resource.h
+#define ttm_resource_manager_for_each_res(cursor, res)   \
+    for (res = ttm_resource_manager_first(cursor); res;  \
+         res = ttm_resource_manager_next(cursor))
+
+// 使用示例（TTM 内部驱逐路径）:
+struct ttm_resource_cursor cursor;
+struct ttm_resource *res;
+
+ttm_resource_cursor_init(&cursor, man);
+ttm_resource_manager_for_each_res(&cursor, res) {
+    struct ttm_buffer_object *bo = res->bo;
+    // 从 LRU 头部开始，遍历所有可驱逐的 resource
+    // 注意：cursor 本身插入链表（作为 hitch），防止遍历时链表变化导致指针失效
+    if (!ttm_bo_eviction_valuable(bo, place))
+        continue;
+    // 预留 + 驱逐
+}
+ttm_resource_cursor_fini(&cursor);
+```
+
+`cursor` 是一个 **hitch 节点**：它自身作为 `TTM_LRU_HITCH` 类型的节点插入 LRU 链表，始终在"下一个待检查 resource"之前。即使在遍历过程中其他线程修改了链表，`cursor.hitch` 作为稳定锚点不会失效。
+
+### 7.7.7 完整追踪架构图
+
+```mermaid
+flowchart TD
+    subgraph bdev["ttm_device (xe->ttm)"]
+        LOCK["lru_lock (spinlock)"]
+        UNEVICT["unevictable list\n(pin/swap-out BOs)"]
+        MANDRV["man_drv[TTM_NUM_MEM_TYPES]"]
+    end
+
+    subgraph SYSMAN["xe_ttm_sys_mgr (XE_PL_TT)"]
+        SYS_USAGE["usage = N bytes"]
+        SYS_LRU0["lru[0] — 低优先级"]
+        SYS_LRU3["lru[3] — 高优先级"]
+    end
+
+    subgraph VMAN["xe_ttm_vram_mgr (XE_PL_VRAM0)"]
+        V_BUDDY["drm_buddy (VRAM 物理空间)"]
+        V_USAGE["usage = M bytes\nvisible_avail = K bytes"]
+        V_LRU0["lru[0] — 低优先级"]
+        V_LRU3["lru[3] — 高优先级"]
+    end
+
+    RES_SMEM["ttm_resource\nmem_type=TT\nlru.link"]
+    RES_VRAM["ttm_resource\nmem_type=VRAM0\nlru.link"]
+    RES_PIN["ttm_resource\n(pinned BO)\nlru.link"]
+
+    MANDRV -->|"man_drv[1]"| SYSMAN
+    MANDRV -->|"man_drv[2]"| VMAN
+    LOCK -. "保护所有 lru[] 操作" .-> SYSMAN
+    LOCK -. "保护所有 lru[] 操作" .-> VMAN
+    LOCK -. "保护 unevictable" .-> UNEVICT
+
+    SYS_LRU0 --> RES_SMEM
+    V_LRU0 --> RES_VRAM
+    UNEVICT --> RES_PIN
+
+    RES_SMEM -. "res->bo" .-> BO_SMEM["xe_bo\n(系统内存中)"]
+    RES_VRAM -. "res->bo" .-> BO_VRAM["xe_bo\n(VRAM 中)"]
+    RES_PIN  -. "res->bo" .-> BO_PIN["xe_bo\n(已 pin，不可驱逐)"]
+```
+
+### 7.7.8 SMEM vs VRAM BO 的追踪方式对比
+
+| 维度 | 系统内存 BO（XE_PL_TT） | VRAM BO（XE_PL_VRAM） |
+|------|------------------------|----------------------|
+| LRU 注册位置 | `xe_ttm_sys_mgr.lru[priority]` | `xe_ttm_vram_mgr.lru[priority]` |
+| 空间使用量统计 | `sys_mgr.usage += size` | `vram_mgr.usage += size`，另有 `visible_avail` |
+| 物理空间管理 | TTM 页面池（`pool`），与 LRU 无关 | `drm_buddy`，`vres->blocks` 链表 |
+| 驱逐扫描路径 | `ttm_resource_manager_for_each_res(sys_mgr)` | `ttm_resource_manager_for_each_res(vram_mgr)` |
+| 驱逐后去向 | → XE_PL_SYSTEM（空 move）或 swap-out | → XE_PL_TT（GPU blit 搬移数据） |
+| pin 后位置 | `bdev->unevictable`（两者相同机制） | `bdev->unevictable`（两者相同机制） |
+| `man->usage` 何时更新 | `ttm_resource_init / fini` 时，受 `lru_lock` | 同左，另 `visible_avail` 在 `mgr->lock`（mutex）下更新 |
+
+## 7.8 内存区域物理布局总图
 
 ```
 系统物理地址空间:
