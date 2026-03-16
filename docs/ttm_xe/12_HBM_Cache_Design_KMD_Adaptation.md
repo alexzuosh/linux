@@ -876,192 +876,485 @@ static void xe_hbm_flush_set(struct xe_gt *gt, u32 bank, u32 set,
 
 ---
 
-## 12.8 Q&A：其他 GPU 厂商如何处理类似的 Cache 维护问题？
+## 12.8 Q&A：其他 GPU 厂商如何处理类似的 Cache 维护问题？（详细版）
 
-> 本节基于 Linux 内核 `drivers/gpu/drm/` 下各厂商驱动源码的实际分析，
-> 并结合公开 ISA/架构文档。
+> 本节**完全基于 Linux 内核 `drivers/gpu/drm/` 下各厂商驱动源码的逐行分析**，
+> 涵盖 AMD GFX9/GFX11、AMD SDMA v6、Qualcomm Adreno A6xx、NVIDIA Nouveau、
+> ARM Mali (Panfrost)、Imagination PowerVR (pvr) 六家厂商。所有代码引用均标注
+> 实际文件路径和行号，可在内核树中直接验证。
 
-### Q: AMD、NVIDIA、Qualcomm、ARM Mali 等厂商如何处理 GPU cache flush/invalidate？与新 HBM cache 设计有何本质区别？
-
-**A：所有主流 GPU 厂商均通过单条 CS 数据包发出全局 cache 操作，不需要 SW 感知
-bank/set/way 结构。这是与新 HBM cache 设计最核心的架构差异。**
+**核心结论（先读结论）**：
+> 所有主流 GPU 厂商均通过**单条/少量 CS 数据包**发出全局或 PA-range cache 操作，
+> **SW 从不直接感知 bank/set/way 结构**。唯一与新 HBM cache 设计在架构上最接近的
+> 先例是 **Imagination PowerVR 的 `KCCB_CMD_SLCFLUSHINVAL` FW 接口**——它也通过
+> FW（MIPS/RISC-V 微控制器）代理执行 SLC PA-range flush，KMD 只提供 `address +
+> size`，FW 内部完成 bank/set 遍历，与本设计中 GuC 代理 HBM flush 的思路完全一致。
 
 ---
 
-### 12.8.1 AMD RDNA3（GFX11）——`ACQUIRE_MEM` + `GCR_CNTL` 数据包
+### 12.8.1 AMD GFX9（Vega/CDNA）——`ACQUIRE_MEM` + 旧式 `CP_COHER_CNTL`
 
-**驱动来源**：`drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c`，
-函数 `gfx_v11_0_emit_mem_sync()`
+**驱动来源**：`drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c`，`gfx_v9_0_emit_mem_sync()`（第 7083 行）
 
 ```c
-/* 实际内核代码（来自 gfx_v11_0.c:6736）*/
-static void gfx_v11_0_emit_mem_sync(struct amdgpu_ring *ring)
+/* gfx_v9_0.c:7083 — GFX9/Vega 时代的全局 cache flush */
+static void gfx_v9_0_emit_mem_sync(struct amdgpu_ring *ring)
 {
-    const unsigned int gcr_cntl =
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_INV(1) |  /* L2 cache (GL2) invalidate */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_WB(1)  |  /* L2 cache writeback        */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_INV(1) |  /* metadata cache invalidate */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_WB(1)  |  /* metadata cache writeback  */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL1_INV(1) |  /* per-shader-array L1 inv   */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLV_INV(1) |  /* vertex data cache inv     */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_INV(1) |  /* scalar data (K$) inv      */
-        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(1);   /* instruction cache inv     */
+    const unsigned int cp_coher_cntl =
+        PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_ICACHE_ACTION_ENA(1) | /* 指令 cache  */
+        PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_SH_KCACHE_ACTION_ENA(1) | /* 标量 K$     */
+        PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_TC_ACTION_ENA(1)        | /* L2 (TC)     */
+        PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_TCL1_ACTION_ENA(1)      | /* per-CU L1   */
+        PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_TC_WB_ACTION_ENA(1);      /* L2 writeback*/
 
     amdgpu_ring_write(ring, PACKET3(PACKET3_ACQUIRE_MEM, 6));
-    amdgpu_ring_write(ring, 0);           /* CP_COHER_CNTL */
-    amdgpu_ring_write(ring, 0xffffffff);  /* CP_COHER_SIZE    ← 全范围 */
-    amdgpu_ring_write(ring, 0xffffff);    /* CP_COHER_SIZE_HI ← 全范围 */
-    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE    ← base=0  */
-    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE_HI */
-    amdgpu_ring_write(ring, 0x0000000A);  /* POLL_INTERVAL */
-    amdgpu_ring_write(ring, gcr_cntl);    /* GCR_CNTL */
+    amdgpu_ring_write(ring, cp_coher_cntl); /* CP_COHER_CNTL */
+    amdgpu_ring_write(ring, 0xffffffff);    /* CP_COHER_SIZE    ← 始终全局 */
+    amdgpu_ring_write(ring, 0xffffff);      /* CP_COHER_SIZE_HI ← 始终全局 */
+    amdgpu_ring_write(ring, 0);             /* CP_COHER_BASE    ← 始终 0   */
+    amdgpu_ring_write(ring, 0);             /* CP_COHER_BASE_HI ← 始终 0   */
+    amdgpu_ring_write(ring, 0x0000000A);    /* POLL_INTERVAL */
+    amdgpu_ring_write(ring, 0);             /* GCR_CNTL (GFX9 不用此字段) */
 }
 ```
 
-**架构特点**：
-- `ACQUIRE_MEM` 数据包**架构上支持 PA range**（`CP_COHER_BASE + CP_COHER_SIZE`）
-- 但驱动实际使用 `BASE=0, SIZE=0xffffffff` → **全局 flush**——无需 SW 知道 PA
-- HW 内部自行确定哪些 cache line 属于该 range，SW 完全不参与 bank/set/way 计算
-- `GCR_CNTL` 各位独立控制多级 cache（GL2/GL1/GLM/GLV/GLK/GLI），精细度高但仍是广播
+**GFX9 接口分析**（与 GFX11 对比）：
+- `CP_COHER_CNTL` 是**按功能位**选择 flush 目标（ICACHE / KCACHE / TC / TCL1）
+- 硬件架构上 `CP_COHER_BASE + CP_COHER_SIZE` 支持 PA range flush——但**GFX6～GFX9 所有
+  驱动实例均使用 `BASE=0, SIZE=0xffffffff`（全局广播）**，从不传入实际地址
+- SW 完全无需参与 bank/set/way 计算
 
 ---
 
-### 12.8.2 Qualcomm Adreno A6xx——`CP_EVENT_WRITE` + CCU flush 事件
+### 12.8.2 AMD RDNA3（GFX11）——`ACQUIRE_MEM` + 精细 `GCR_CNTL` + `RELEASE_MEM` 双路径
+
+**驱动来源**：`drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c`（第 6735 行 & 第 5935 行）
+
+#### 路径 A：`ACQUIRE_MEM`（显式屏障，适用于 compute / graphics dispatch 之前）
+
+```c
+/* gfx_v11_0.c:6735 — RDNA3 GCR_CNTL 精细级别控制 */
+static void gfx_v11_0_emit_mem_sync(struct amdgpu_ring *ring)
+{
+    const unsigned int gcr_cntl =
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_INV(1) |  /* Shader L2 (GL2) invalidate */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_WB(1)  |  /* Shader L2 writeback        */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_INV(1) |  /* metadata cache invalidate  */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_WB(1)  |  /* metadata cache writeback   */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL1_INV(1) |  /* per-shader-array L1 inv    */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLV_INV(1) |  /* vertex data cache inv      */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_INV(1) |  /* scalar data cache (K$) inv */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(1);   /* instruction cache inv      */
+
+    amdgpu_ring_write(ring, PACKET3(PACKET3_ACQUIRE_MEM, 6));
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_CNTL (GFX11 已弃用旧 TC 位) */
+    amdgpu_ring_write(ring, 0xffffffff);  /* CP_COHER_SIZE    ← 始终全局         */
+    amdgpu_ring_write(ring, 0xffffff);    /* CP_COHER_SIZE_HI ← 始终全局         */
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE    ← 始终 0           */
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE_HI ← 始终 0           */
+    amdgpu_ring_write(ring, 0x0000000A);  /* POLL_INTERVAL                       */
+    amdgpu_ring_write(ring, gcr_cntl);    /* GCR_CNTL（RDNA3 新增字段）           */
+}
+```
+
+**GFX9→GFX11 演进关键点**：
+
+| 字段 | GFX9 | GFX11 |
+|------|------|-------|
+| 控制字段 | `CP_COHER_CNTL`（功能位） | `GCR_CNTL`（细粒度级别位） |
+| L2 控制 | `TC_ACTION_ENA + TC_WB` | `GL2_INV + GL2_WB`（独立） |
+| per-CU L1 | `TCL1_ACTION_ENA` | `GL1_INV`（独立） |
+| 新增 | 不支持 | `GLM`（元数据）、`GLV`（顶点）、`GLI`（指令）独立位 |
+| PA range | 架构支持，驱动不用 | 架构支持，驱动仍不用 |
+
+#### 路径 B：`RELEASE_MEM`（fence 写入时隐式 cache flush）
+
+```c
+/* gfx_v11_0.c:5935 — RELEASE_MEM 同时完成 fence + cache flush */
+/* 用于 job 结束时：cache dirty lines writeback + fence value 原子写入 */
+amdgpu_ring_write(ring, PACKET3(PACKET3_RELEASE_MEM, 6));
+amdgpu_ring_write(ring,
+    PACKET3_RELEASE_MEM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) |
+    PACKET3_RELEASE_MEM_EVENT_INDEX(EVENT_INDEX_CACHE_FLUSH)      |
+    PACKET3_RELEASE_MEM_GCR_GLM_INV | /* metadata inv */
+    PACKET3_RELEASE_MEM_GCR_GLM_WB  | /* metadata wb  */
+    PACKET3_RELEASE_MEM_GCR_GL2_WB  | /* L2 writeback (no inv needed at end of job) */
+    PACKET3_RELEASE_MEM_CACHE_POLICY(cache_policy));
+/* ... 后续 dword：fence 地址 + value */
+```
+
+**关键设计**：`RELEASE_MEM` 将"cache flush"与"fence semaphore 写入"**合并为一个 CP 原语**，
+消除了潜在的 TOCTOU race（flush 完成和 fence 写入之间状态不一致）。这是与新 HBM 设计
+的重要对比：新设计如需同样语义，必须在 GuC 中实现等价的"flush + fence 原子操作"。
+
+---
+
+### 12.8.3 AMD SDMA v6——`SDMA_OP_GCR_REQ`：硬件已支持 VA-range 精确 flush，但驱动未使用
+
+**驱动来源**：`drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c`，第 299 行，
+`sdma_v6_0_ring_emit_mem_sync()`
+
+```c
+/* sdma_v6_0.c:299 — SDMA_OP_GCR_REQ 数据包结构（含 VA range 字段） */
+static void sdma_v6_0_ring_emit_mem_sync(struct amdgpu_ring *ring, uint32_t hdp_flags)
+{
+    uint32_t gcr_cntl =
+        SDMA_GCR_GL2_INV | SDMA_GCR_GL2_WB |
+        SDMA_GCR_GLM_INV | SDMA_GCR_GLM_WB |
+        SDMA_GCR_GL1_INV | SDMA_GCR_GL1_WB;
+
+    amdgpu_ring_write(ring,
+        SDMA_PKT_COPY_LINEAR_HEADER_OP(SDMA_OP_GCR_REQ));
+
+    /* ─── VA range 字段（硬件支持，驱动全填 0 = 全局 flush）─── */
+    amdgpu_ring_write(ring,
+        SDMA_PKT_GCR_REQ_PAYLOAD1_BASE_VA_31_7(0));         /* VA range start [31:7]  */
+
+    amdgpu_ring_write(ring,
+        SDMA_PKT_GCR_REQ_PAYLOAD2_GCR_CONTROL_15_0(gcr_cntl) |
+        SDMA_PKT_GCR_REQ_PAYLOAD2_BASE_VA_47_32(0));        /* VA range start [47:32] */
+
+    amdgpu_ring_write(ring,
+        SDMA_PKT_GCR_REQ_PAYLOAD3_LIMIT_VA_31_7(0) |        /* VA range end [31:7]   */
+        SDMA_PKT_GCR_REQ_PAYLOAD3_GCR_CONTROL_18_16(
+            gcr_cntl >> 16));
+
+    amdgpu_ring_write(ring,
+        SDMA_PKT_GCR_REQ_PAYLOAD4_LIMIT_VA_47_32(0) |       /* VA range end [47:32]  */
+        SDMA_PKT_GCR_REQ_PAYLOAD4_VMID(0));                 /* VMID                  */
+}
+```
+
+**SDMA_OP_GCR_REQ 数据包字段解析**：
+
+```
+  DW0: SDMA_OP_GCR_REQ opcode
+  DW1: [31:7]  BASE_VA_31_7   ← VA 范围起始地址 [31:7] (64B 对齐)
+  DW2: [15:0]  GCR_CONTROL_15_0  ← cache level 控制位低 16 位
+       [31:16] BASE_VA_47_32  ← VA 范围起始地址 [47:32]
+  DW3: [31:7]  LIMIT_VA_31_7  ← VA 范围结束地址 [31:7]
+       [2:0]   GCR_CONTROL_18_16 ← cache level 控制位高 3 位
+  DW4: [15:0]  LIMIT_VA_47_32 ← VA 范围结束地址 [47:32]
+       [19:16] VMID            ← 目标 VMID（支持多 VM 隔离）
+
+  硬件能力：向 SDMA 提交 BASE_VA + LIMIT_VA → HW 仅 flush 该 VA range 内的 cache lines
+  驱动实现：BASE_VA=0, LIMIT_VA=0 → 驱动触发全局 flush（HW 将 0/0 解释为"全部"）
+```
+
+**对新 HBM cache 设计的意义**：
+- AMD SDMA v6 在**硬件层面已经实现了 VA-range 精确 cache flush**，只是 AMDGPU 驱动
+  选择不使用（原因：GFX ring 与 SDMA 共享同一套 GL2 cache，VA-range 优化依赖
+  VMID-to-PA TLB 映射一致性，实现较复杂）
+- 如果新 HBM cache 的 CS packet 设计遵循类似 `(BASE_VA, LIMIT_VA, VMID)` 接口模型，
+  则**驱动实现可直接映射到 GuC 侧的精确 flush**，无需 SW 暴露 bank/set/way
+
+---
+
+### 12.8.4 Qualcomm Adreno A6xx——`CP_EVENT_WRITE` + CCU/UCHE/LRZ 分层 flush
 
 **驱动来源**：`drivers/gpu/drm/msm/adreno/a6xx_gpu.c`
 
+Adreno A6xx 拥有三层需要显式 flush 的 cache 结构：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Adreno A6xx Cache 层次                                     │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  LRZ Cache   │  │  CCU (Color/ │  │  UCHE (Unified   │  │
+│  │  (Lossless   │  │  Depth Cache │  │  Command/Cache   │  │
+│  │   Raster Z)  │  │  Unit, L1 WB)│  │  ~512KB, L2)     │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘  │
+│         │                 │                    │            │
+│         └─────────────────┴────────────────────┘            │
+│                           │                                 │
+│                      DRAM / SYSMEM                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ```c
-/* 每次 job 提交前：CCU（Color Cache Unit）全局 invalidate */
+/* a6xx_gpu.c — job submit 前：CCU 分离 invalidate（depth / color 分开处理）*/
 OUT_PKT7(ring, CP_EVENT_WRITE, 1);
-OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_DEPTH));
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_DEPTH)); /* depth CCU inv  */
 
 OUT_PKT7(ring, CP_EVENT_WRITE, 1);
-OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_COLOR));
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_COLOR)); /* color CCU inv  */
 
-/* job 执行完毕后：CACHE_FLUSH_TS 事件写 fence 值并触发中断 */
+/* context switch 路径：全 cache invalidate */
+OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(CACHE_INVALIDATE));        /* UCHE 全 inv   */
+
+OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(LRZ_FLUSH_INVALIDATE));   /* LRZ flush+inv  */
+
+/* job 完成后：CACHE_FLUSH_TS 原子写入 fence + 触发 IRQ */
 OUT_PKT7(ring, CP_EVENT_WRITE, 4);
 OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS) | CP_EVENT_WRITE_0_IRQ);
-OUT_RING(ring, lower_32_bits(rbmemptr(ring, fence)));
-OUT_RING(ring, upper_32_bits(rbmemptr(ring, fence)));
-OUT_RING(ring, submit->seqno);
+OUT_RING(ring, lower_32_bits(rbmemptr(ring, fence)));  /* fence PA 低 32 位 */
+OUT_RING(ring, upper_32_bits(rbmemptr(ring, fence)));  /* fence PA 高 32 位 */
+OUT_RING(ring, submit->seqno);                          /* fence 值          */
 ```
 
 **架构特点**：
-- CCU（Color Cache Unit）是每个 RB（Render Backend）的写合并缓冲区，类似 L1 write buffer
-- `CP_EVENT_WRITE` 事件是**全局广播**，不带任何 PA 地址参数
-- SW 完全无需了解 CCU 内部结构（set/way/bank 等），HW 自动 flush 所有 CCU
-- Adreno 的 L2（UCHE，Unified Command/Constant/Clip/Color/Compute Cache）同样通过
-  `CP_EVENT_WRITE(FLUSH_INVALIDATE_CACHE)` 整体 flush，无 PA range
+- `CP_EVENT_WRITE` 事件均为**全局广播**，无 PA range 参数
+- `CACHE_FLUSH_TS` 将"cache writeback"与"fence value 写入 DRAM"合并为**原子操作**
+  （与 AMD `RELEASE_MEM` 设计完全相同），消除 race condition
+- LRZ cache 独立 flush 命令证明：即使同一厂商内不同功能的 cache 也需单独 flush 原语
 
 ---
 
-### 12.8.3 NVIDIA Hopper/Ampere（以 Nouveau/CUDA 公开信息为参考）
+### 12.8.5 NVIDIA Nouveau——BAR Aperture Flush（GPU L2 硬件相干，无需 SW flush）
 
-**NVIDIA 方式**：通过 **PTX `membar` 指令** + **CS SEMAPHORED packet** 处理一致性
+**驱动来源**：`drivers/gpu/drm/nouveau/nvkm/subdev/bar/g84.c` &
+`drivers/gpu/drm/nouveau/nvkm/subdev/bar/r535.c`
+
+**重要澄清**：NVIDIA GPU L2 cache 对所有 SM **硬件相干**，KMD **无需显式 flush GPU
+L2**。Nouveau 的 "bar flush" 针对的是 **CPU→GPU BAR aperture 写合并缓冲区**：
+
+```c
+/* g84.c — BAR aperture flush（非 GPU L2，是 CPU WC write buffer 的 drain）*/
+static void
+g84_bar_flush(struct nvkm_bar *bar)
+{
+    struct nvkm_device *device = bar->subdev.device;
+    nvkm_wr32(device, 0x070000, 0x00000001);    /* 写触发寄存器 */
+    nvkm_msec(device, 2000,                     /* 最长等待 2 秒 */
+        if (!(nvkm_rd32(device, 0x070000) & 0x00000002))
+            break;                               /* bit 1=0 表示完成 */
+    );
+}
+
+/* r535.c — Hopper GSP 路径：通过 BAR2 read-back 触发 WC 写入串行化 */
+static void
+r535_bar_flush(struct nvkm_bar *bar)
+{
+    ioread32_native(bar->flushBAR2);  /* BAR2 read-back 强制所有 WC 写入到达 GPU */
+}
+```
+
+**NVIDIA coherency 模型总结**：
 
 ```
-# Shader 内：全局内存屏障（等价于 flush 所有 L1/L2 pending write）
-membar.gl;      /* GPU-global scope: 等待所有 prior global writes visible to all SMs */
-membar.sys;     /* System scope:     还包含 CPU 可见性 (NVLink / PCIe flush) */
+CPU write to BAR1 (WC 映射)
+    → CPU WC write buffer 积累
+    → g84_bar_flush() / ioread32_native() → 强制 WC buffer drain
+    → GPU 寄存器 / VRAM
 
-# Driver CS path：
-# SEMAPHORED packet 中的 RELEASE_WFI=EN 确保 GPU idle 后才写 semaphore
-# 等价于隐式的全局 L2 flush（GPU 内部自动处理）
+GPU L2 cache (SM GPC tile cache)
+    → hardware coherent across ALL SM clusters（无手动 inv 需求）
+    → ordering barrier only: SEMAPHORED.RELEASE_WFI=EN（GPU idle wait）
+    → CPU visibility: membar.sys in shader / NVLink-PCIe completion ordering
 ```
-
-**架构特点**：
-- NVIDIA L2 cache 对所有 SM **硬件一致**（SM 之间 L2 line 共享，无手动 inv 需求）
-- SW 的工作仅是内存序屏障（`membar`），而非显式 cache maintenance
-- NVIDIA 从不向 KMD 暴露 L2 bank/set/way 结构——完全黑盒
-- CUDA `__threadfence_system()` 扩展到 CPU 可见性（隐含 NVLink/PCIe flush）
 
 ---
 
-### 12.8.4 ARM Mali（Panfrost 驱动）
+### 12.8.6 ARM Mali（Panfrost）——GPU_CMD 寄存器 + IRQ 完成 + 按 job 自动 flush
 
-**驱动来源**：`drivers/gpu/drm/panfrost/`
+**驱动来源**：`drivers/gpu/drm/panfrost/panfrost_regs.h` +
+`drivers/gpu/drm/panfrost/panfrost_job.c`
 
-Mali 几乎**不需要显式 GPU cache maintenance**，原因：
+#### 全局 Cache 操作
 
+```c
+/* panfrost_regs.h — GPU_CMD 寄存器 cache 操作命令码 */
+#define GPU_CMD_CLEAN_CACHES       0x07  /* writeback dirty lines，保留 valid 状态 */
+#define GPU_CMD_CLEAN_INV_CACHES   0x08  /* writeback + invalidate all lines       */
+
+/* 触发：直接写 GPU_CMD MMIO 寄存器 */
+gpu_write(pfdev, GPU_CMD, GPU_CMD_CLEAN_INV_CACHES);
+
+/* 等待完成：poll / IRQ GPU_IRQ_STATUS.CLEAN_CACHES_COMPLETED (BIT(17)) */
 ```
-Mali GPU → ARM bus interconnect (ACE-Lite / CHI) → ARM CPU LLC
-                     ↑
-              HW 硬件一致性协议
-              Mali L2 cache 参与 ARM coherency domain
-              CPU/GPU 对同一 PA 的访问自动一致
+
+#### 按 Job 自动 Flush（JS_CONFIG 寄存器）
+
+```c
+/* panfrost_job.c — 每个 job 的 JS_CONFIG 配置 */
+uint32_t cfg = JS_CONFIG_THREAD_PRI(8) |
+               JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE |  /* job 启动前自动 flush */
+               JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE;     /* job 结束后自动 flush */
+
+/* 高级优化：HW flush reduction（基于 generation ID 跳过冗余 flush）*/
+if (panfrost_has_hw_feature(pfdev, HW_FEATURE_FLUSH_REDUCTION)) {
+    cfg |= JS_CONFIG_ENABLE_FLUSH_REDUCTION;
+    /* Mali HW 维护 flush generation counter；
+     * 若相邻 job 共享同一 flush_id → HW 自动跳过重复 flush */
+    job_write(pfdev, JS_FLUSH_ID_NEXT(js), job->flush_id);
+}
+job_write(pfdev, JS_CONFIG_NEXT(js), cfg);
 ```
 
-- Mali GPU 使用 ARM **ACE-Lite 总线协议**，GPU L2 自动参与 ARM CPU 的 coherency domain
-- 对于 DMA 操作，使用标准 Linux `dma_sync_*` / IOMMU 维护，不需要 GPU-specific cache ops
-- Panfrost 驱动中唯一的 cache 操作是 **MMU TLB flush**，不涉及 data cache
+**`JS_CONFIG_ENABLE_FLUSH_REDUCTION` 的设计价值**：
+- Mali HW 维护单调递增的"flush generation counter"，每次 cache flush 后递增
+- 每个 job 提交时带上 flush_id；若两个连续 job 共享同一 flush_id，HW 自动跳过第二次
+- **这与通过 GuC 维护 `last_flush_seqno` 跳过冗余 flush 的设计思想完全一致**，
+  Mali 证明 generation-based flush deduplication 在生产驱动中可行
 
 ---
 
-### 12.8.5 各厂商对比汇总
+### 12.8.7 Imagination PowerVR（pvr 驱动）——最接近新 HBM 设计的现有先例
 
-| 维度 | AMD RDNA3 | Qualcomm Adreno | NVIDIA Hopper | ARM Mali | **新 HBM cache 设计** |
-|------|----------|-----------------|---------------|---------|----------------------|
-| **Cache 一致性机制** | SW 显式 CS 数据包 | SW 显式 CS 事件 | HW 一致（L2） | HW 一致（ACE-Lite） | **SW 显式 MMIO 循环** |
-| **flush 接口** | `ACQUIRE_MEM` packet | `CP_EVENT_WRITE` | `membar` 指令 | `dma_sync_*` | **CACHE_BANKN_FLUSH_SET MMIO** |
-| **PA range 支持** | 架构支持（驱动用全局） | 不支持 | 不支持 | 不适用 | **必须按 cacheline 逐一操作** |
-| **SW 需知 bank/set/way** | 否 | 否 | 否 | 否 | **bank+set 需 SW 计算**（way 由 HW 决定） |
-| **单次操作代价** | 1 条 PM4 数据包 | 1 条 PM4 事件 | 1 条 PTX 指令 | 无 | **最坏 18,432 次 MMIO** |
-| **异步 fence 集成** | 原生（PM4 pipeline） | 原生（PM4 pipeline） | 原生（semaphore） | 原生（dma_fence） | **需要额外封装** |
-| **KMD 感知 cache 结构** | 否 | 否 | 否 | 否 | **是（hash 函数必须硬编码）** |
+**驱动来源**：`drivers/gpu/drm/imagination/pvr_rogue_fwif.h`（第 957 行）
+
+PowerVR 的 SLC（System Level Cache，~4MB 物理索引 GPU L2）flush 通过 **KCCB（Kernel
+Command & Control Buffer）FW 消息队列**发送给嵌入式 FW（旧 MIPS，新 RISC-V）执行，
+**KMD 从不直接写 SLC bank 寄存器**：
+
+```c
+/* pvr_rogue_fwif.h:957 — SLC flush/invalidate FW 命令 payload */
+struct rogue_fwif_slcflushinvaldata {
+    u32          context_fw_addr;  /* GPU 上下文 FW 地址（FW 用于 fence 目标） */
+    bool         inval;            /* true = flush + invalidate; false = flush only */
+    bool         dm_context;       /* flush 范围选择：                              */
+                                   /*   true  = 按 DM context scope（整个上下文）   */
+                                   /*   false = 按 PA range（address + size）        */
+    aligned_u64  address;          /* PA range 起始地址（当 dm_context=false 时）   */
+    aligned_u64  size;             /* PA range 大小（字节，当 dm_context=false 时） */
+};
+
+/* KCCB 命令码 */
+#define ROGUE_FWIF_KCCB_CMD_SLCFLUSHINVAL  105
+```
+
+**KMD 侧发送示例（简化）**：
+
+```c
+struct rogue_fwif_kccb_cmd cmd = {
+    .cmd_type = ROGUE_FWIF_KCCB_CMD_SLCFLUSHINVAL,
+};
+struct rogue_fwif_slcflushinvaldata *data = &cmd.cmd_data.slcflushinvaldata;
+
+data->context_fw_addr = context->fw_addr;
+data->inval           = true;           /* flush + invalidate */
+data->dm_context      = false;          /* 使用 PA range 模式 */
+data->address         = bo->pa_base;    /* BO 物理起始地址    */
+data->size            = bo->size;       /* BO 大小            */
+
+/* 将命令写入 KCCB 环形缓冲区，doorbell 通知 FW */
+pvr_kccb_send_cmd(pvr_dev, &cmd, NULL);
+
+/* FW（MIPS/RISC-V）收到命令后：
+ *   1. 解析 address + size
+ *   2. 内部计算 SLC bank/set/way（FW 知道 SLC hash 函数）
+ *   3. 遍历相关 SLC bank，执行 writeback + invalidate
+ *   4. 写 KCCB return code 通知 KMD 完成
+ */
+```
+
+**PowerVR 设计与新 HBM 设计的直接对应关系**：
+
+```
+PowerVR                               新 HBM cache 设计（建议方向）
+──────────────────────────────────    ──────────────────────────────────────────
+SLC（物理索引 GPU L2 cache）     ←→   HBM cache（物理索引 HBM 旁路 cache）
+KCCB FW 消息队列                 ←→   GuC CT 命令消息队列
+ROGUE_FWIF_KCCB_CMD_SLCFLUSHINVAL ←→  XE_GUC_ACTION_HBM_CACHE_FLUSH_RANGE（待定义）
+rogue_fwif_slcflushinvaldata      ←→  xe_guc_hbm_flush_range_data { u64 pa; u64 size; }
+FW 内部遍历 SLC bank/set/way      ←→  GuC FW 内部遍历 HBM cache bank/set/way
+KMD 只提供 PA + size              ←→  KMD 只提供 PA + size（不感知 bank 结构）
+```
+
+**PowerVR 先例的核心价值**：
+1. **证明 FW 代理 PA-range cache flush 在生产驱动中可行**（上市产品，非实验性）
+2. **两种 flush 模式对应 XE 的两种场景**：
+   - `dm_context=true`：整个 GPU context evict（类似 XE 的 `xe_vm_unbind_all`）
+   - `dm_context=false`：精确 BO PA range flush（类似 XE 的 `xe_bo_evict` 单个 BO）
+3. **KMD-FW 接口极简**：仅 `address + size + inval flag`，无 bank/set/way 泄漏
+4. **FW 封装 hash 复杂性**：hash 函数升级只需更新 FW，KMD uAPI 接口不变
 
 ---
 
-### 12.8.6 关键启示：推荐的硬件接口设计方向
+### 12.8.8 六厂商横向对比表
 
-从所有主流厂商的实践来看，正确的解决方案是**让 HW 承担 PA→bank/set/way 的映射**，
-SW 只需提供 PA range（或 CS packet 触发全局 flush）：
+| 维度 | AMD GFX9 | AMD GFX11 | AMD SDMA v6 | Qualcomm A6xx | NVIDIA Nouveau | Mali Panfrost | PowerVR pvr | **新 HBM（当前）** |
+|------|---------|-----------|------------|--------------|----------------|---------------|-------------|-----------------|
+| **缓存层次** | L1+L2（TC/SH） | GL1/GL2/GLM/GLV | 同 GFX11 | CCU/UCHE/LRZ | SM L1 + GPC L2 | Mali L2（ACE-Lite） | SLC（~4MB PA索引） | HBM cache（PA索引） |
+| **flush 触发接口** | `ACQUIRE_MEM` PM4 | `ACQUIRE_MEM+GCR_CNTL` | `SDMA_OP_GCR_REQ` | `CP_EVENT_WRITE` | BAR MMIO write | `GPU_CMD` MMIO | **KCCB FW 消息** | MMIO CACHE_BANKN_FLUSH_SET |
+| **PA/VA range 支持** | 架构有，驱动不用 | 架构有，驱动不用 | **HW VA range，驱动不用** | 不支持 | 不适用（L2 HW 相干） | 不支持 | **PA range（address+size）** | 必须逐 cacheline |
+| **flush+fence 原子性** | `RELEASE_MEM` 原子 | `RELEASE_MEM` 原子 | 不适用 | `CACHE_FLUSH_TS` 原子 | `SEMAPHORED.RELEASE_WFI` | GPU_IRQ 完成 | FW 回调通知 | **无原子机制** |
+| **SW 需知 bank/set/way** | 否 | 否 | 否 | 否 | 否 | 否 | **否（FW 代理）** | **是（bank+set 需 SW 计算）** |
+| **冗余 flush 优化** | 无 | 无 | 无 | 无 | 不适用 | **JS flush ID** | DM context scope | seqno dedup（GuC） |
+| **单次操作代价** | 1 PM4 包 | 1 PM4 包 | 1 SDMA 包 | 1–2 PM4 事件 | 1 MMIO + poll | 1 MMIO write | **1 KCCB msg** | **最坏 18,432 MMIO** |
+| **FW/微控制器代理** | 否（CP 硬件） | 否（CP 硬件） | 否（SDMA 硬件） | 否（GPC 硬件） | 否（HW 相干） | 否（GPU_CMD） | **是（RISC-V FW）** | **建议是（GuC FW）** |
+
+---
+
+### 12.8.9 核心架构启示与设计建议
+
+#### 启示 1：AMD SDMA VA-range GCR_REQ 证明精确 range flush 可工程化实现
+
+AMD SDMA v6 的 `SDMA_OP_GCR_REQ` 已在**硬件层面实现了 VA-range 精确 cache flush**，
+字段 `BASE_VA_31_7 / BASE_VA_47_32 / LIMIT_VA_31_7 / LIMIT_VA_47_32` 完整覆盖
+48-bit VA 空间。驱动未使用主要是策略选择，非能力缺失。对新 HBM 设计的启示：
+**精确 range flush 的 CS packet 接口在硬件工程上完全可行**。
+
+#### 启示 2：PowerVR FW-mediated flush 是本设计最直接的参考先例
 
 ```
-主流厂商范式（SW 只看 PA，HW 内部做 bank/set/way）：
-
-  SW: ACQUIRE_MEM(PA_base=X, size=N)
-       ↓
-  HW: for each PA in [X, X+N):
-          bank = hash(PA)             ← HW 内部，SW 不可见
-          set  = PA[bits]             ← HW 内部，SW 不可见
-          tag  = PA[tag_bits]         ← HW 内部，SW 不可见
-          for way in 0..7:
-              if cache[bank][set][way].tag == tag:
-                  writeback if dirty
-                  invalidate
+PowerVR KMD → KCCB msg {PA, size, inval} → RISC-V FW → SLC bank/set flush
+XE KMD      → GuC CT cmd {PA, size}      → GuC FW    → HBM bank/set flush
 ```
 
-**推论**：新 HBM cache 设计如果要对齐业界标准，**最应该提供的 HW 接口是
-PA-range flush CS packet**（类似 AMD `ACQUIRE_MEM` 带精确 range），而不是让
-SW 逐 bank 写 MMIO 寄存器。这样可以：
+KMD 侧极简接口（参考 `rogue_fwif_slcflushinvaldata`）：
 
-1. 消除 SW 硬编码 hash 函数的风险
-2. 操作代价从 O(cachelines) 降至 O(1) 个 CS packet
-3. 与 dma_fence 原生集成（CS pipeline 异步执行）
-4. 未来 hash 函数变更不需要修改 KMD
+```c
+/* 建议的 XE GuC HBM flush CT 命令 payload */
+struct xe_guc_hbm_flush_params {
+    u64  pa_start;   /* 物理地址起始（cacheline 对齐）*/
+    u64  pa_size;    /* 字节数（cacheline 对齐）      */
+    u32  flags;      /* bit 0: invalidate; bit 1: all_ways */
+};
+```
 
-**SW MMIO loop 方案**（当前讨论的路径）应仅作为 HW PA-range packet 不可用时的
-fallback，而非主路径。
+GuC FW 内部维护 HBM hash 函数，遍历 bank/set，完成后通过 GuC-to-KMD 中断通知。
+
+#### 启示 3：Mali JS flush ID 验证了 generation-based dedup 的生产可行性
+
+Mali `JS_CONFIG_ENABLE_FLUSH_REDUCTION` + `JS_FLUSH_ID` 已证明：基于单调
+generation counter 跳过冗余 flush 的方案在量产 GPU 驱动中正确且有效——
+可直接用于指导 GuC `last_flush_seqno` 机制的设计。
+
+#### 优先级排序
+
+```
+优先级 1（最优）：GuC CT 命令携带 (PA_base, PA_size)，GuC FW 内部完成 HBM flush
+  参考：PowerVR KCCB_CMD_SLCFLUSHINVAL
+  代价：O(1) CT 命令；KMD 无需感知 bank 结构；hash 变更只改 FW
+
+优先级 2（次优）：CS packet 携带 (PA_base, PA_limit)，GPU CP 硬件执行 HBM flush
+  参考：AMD SDMA_OP_GCR_REQ 的 VA range 字段设计
+  代价：O(1)；需 GPU CP 硬件支持（未来 Xe IP 可实现）
+
+优先级 3（临时 fallback）：KMD SW MMIO loop（本文 §12.3-§12.5 方案）
+  代价：O(N_cachelines × N_ways)，最坏 18,432 MMIO 写
+  仅在优先级 1/2 不可用时作为过渡方案
+```
 
 ```mermaid
 flowchart LR
-    subgraph AMD["AMD RDNA3"]
-        A1["SW: ACQUIRE_MEM\n(PA_base, size)\n1 packet"] --> A2["HW: 内部 bank/set/way\nCAM lookup\n透明"]
+    subgraph AMD_GFX["AMD GFX11\n(ACQUIRE_MEM)"]
+        AG1["SW: 1× ACQUIRE_MEM\n+ GCR_CNTL"] --> AG2["CP HW: 内部\nbank/set/way 遍历\n对 SW 透明"]
     end
-    subgraph QCOM["Qualcomm Adreno"]
-        Q1["SW: CP_EVENT_WRITE\n(CACHE_FLUSH_TS)\n1 event"] --> Q2["HW: CCU/UCHE\nglobal flush\n透明"]
+    subgraph AMD_SDMA["AMD SDMA v6\n(GCR_REQ VA-range)"]
+        AS1["SW: 1× SDMA_OP_GCR_REQ\n+ BASE_VA + LIMIT_VA"] --> AS2["SDMA HW: 仅 flush\nVA range 内\n精确，对 SW 透明"]
     end
-    subgraph NV["NVIDIA"]
-        N1["SW: membar.gl\n1 PTX instruction"] --> N2["HW: L2 coherency\nauto-managed\n完全透明"]
+    subgraph QCOM["Qualcomm A6xx\n(CP_EVENT_WRITE)"]
+        QC1["SW: 1× CP_EVENT_WRITE\nCACHE_FLUSH_TS+IRQ"] --> QC2["GPC HW: CCU/UCHE\n全局 flush\nfence 原子写入"]
     end
-    subgraph NEW["新 HBM cache（当前方案）"]
-        X1["SW: 计算 hash\n→ 18432 次 MMIO"] --> X2["HW: 单个 set 操作\n需 SW 驱动循环"]
+    subgraph PVR["PowerVR pvr\n(KCCB FW msg)"]
+        PV1["SW: KCCB 消息\n{PA, size, inval}"] --> PV2["FW(RISC-V):\n内部 SLC bank 遍历\nflush，IRQ 回调"]
     end
-    subgraph IDEAL["新 HBM cache（理想方案）"]
-        I1["SW: 类 ACQUIRE_MEM\n1 CS packet\n(PA_base, size)"] --> I2["HW: 内部 hash+CAM\n透明完成"]
+    subgraph NEW_OLD["新 HBM cache\n(当前 SW MMIO loop)"]
+        X1["SW: 计算 hash\n最坏 18,432×\nMMIO 写"] --> X2["HW: 每次写\n一个 set 操作\n需 SW 驱动循环"]
+    end
+    subgraph NEW_IDEAL["新 HBM cache\n(建议 GuC CT 方案)"]
+        I1["SW: 1× GuC CT\n{PA_base, PA_size}"] --> I2["GuC FW:\n内部 HBM bank 遍历\nflush + 完成通知"]
     end
 
     style X1 fill:#ffcccc,stroke:#cc0000
     style X2 fill:#ffcccc,stroke:#cc0000
     style I1 fill:#d4edda,stroke:#28a745
     style I2 fill:#d4edda,stroke:#28a745
+    style PV1 fill:#fff3cd,stroke:#ffc107
+    style PV2 fill:#fff3cd,stroke:#ffc107
+```
