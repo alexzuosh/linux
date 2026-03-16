@@ -643,3 +643,119 @@ static int xe_cache_flush_build_cs_batch(struct xe_cache_flush_pending *p,
 | 4 | **Flush 完成的同步机制**（poll status bit 还是 CS completion signal） | 影响 CPU MMIO 路径的轮询方式与 CS 路径的 fence 插入点 | BSpec |
 | 5 | **CS LRI 能否写 HBM bank flush 寄存器**（CS 特权级 vs HBM controller 地址范围） | 决定是否能走 GPU CS 异步路径；若不能，生产路径只能 CPU MMIO | BSpec + CS privilege model |
 | 6 | **Cacheline size 是 128B 还是 256B** | 直接影响 4KB page 涉及 bank 数量（32 vs 16），以及 bitmap 大小计算 | BSpec |
+
+---
+
+## 12.6 Q&A：由 GuC FW 执行 Cache Flush/Inv 的性能可行性分析
+
+### Q: 如果把 cache flush/invalidate 交给 GuC FW 执行，性能是否可以接受？
+
+**A：GuC FW 方案比 CPU MMIO 快约 8×，整体可接受，但有 CT 往返开销和单线程串行的局限。**
+
+### 核心优势：绕开 PCIe，换成 on-die GT 内部 fabric
+
+GuC 是 GT 片上的微控制器（~400 MHz），它写 MMIO 寄存器走的是 **GT 内部总线**，
+而不是 CPU 侧的 PCIe MMIO 路径：
+
+```
+CPU MMIO write:   CPU → PCIe Root Complex → PCIe link → GT MMIO
+                  latency ≈ 100–300 ns per write
+
+GuC MMIO write:   GuC uC → GT internal fabric → cache bank register
+                  latency ≈ 10–25 ns per write (on-die)
+```
+
+**全量 18,432 次写的耗时估算**：
+
+| 执行者 | 单次 MMIO 延迟 | 18,432 次总耗时 | 可接受性 |
+|--------|--------------|----------------|---------|
+| CPU（PCIe MMIO） | ~200 ns | **~3.7 ms** | ✗ 不可接受 |
+| **GuC uC（on-die）** | ~25 ns | **~460 μs** | △ 勉强可接受 |
+| GPU CS LRI（~1 GHz ring） | ~3 ns | **~55 μs** | ✓ 最快（存在权限不确定性） |
+| GuC + HW tag-match flush（若 BSpec 支持） | N/A | **< 1 μs** | ✓✓ 最理想 |
+
+### GuC 方案的执行流程
+
+```
+KMD 侧:
+  1. 将 xe_cache_flush_pending bitmap 放入 GGTT-mapped buffer（GuC 可访问）
+  2. xe_guc_ct_send(H2G: XE_GUC_ACTION_CACHE_FLUSH,
+                    bitmap_ggtt_addr, bitmap_size_bits)
+  3. 挂起等待 G2H 回复（映射为 dma_fence）
+
+GuC FW 侧:
+  1. 收到 H2G，读取 bitmap buffer
+  2. for_each_set_bit(bit, bitmap):
+       bank = bit / SETS_PER_BANK
+       set  = bit % SETS_PER_BANK
+       MMIO_WRITE(CACHE_BANKN_FLUSH_SET(bank),
+                  set | FLUSH_ALL_WAYS | TRIGGER)  ← on-die, ~25ns/write
+  3. xe_guc_ct_send(G2H: XE_GUC_RESPONSE_CACHE_FLUSH_DONE, seqno)
+
+KMD 侧:
+  4. 收到 G2H → dma_fence_signal(flush_fence)
+  5. 返回 fence 给调用者（完全异步）
+```
+
+与 CS LRI 方案不同，GuC 写 GT MMIO 不存在权限问题（GuC 本身就有完整的
+GT MMIO 访问权，`xe_guc_mmio_write` 路径已有先例）。
+
+### GuC 方案的主要局限
+
+| 问题 | 影响 |
+|------|------|
+| **CT 往返开销约 50–200 μs** | 对小 flush（≤ 16 cachelines），CT 调度开销大于实际 MMIO 时间，不如 CPU 直接写 |
+| **GuC 单线程串行** | GuC ~400 MHz 且串行写寄存器，无法并发利用 144 bank 的物理并行能力 |
+| **GuC 与调度竞争** | GuC 同时负责 context scheduling、GuC-PC 功耗管理、reset handling；大量 flush 会增加调度 latency |
+| **FW 复杂度增加** | GuC FW 中加入 bitmap 迭代逻辑，增加验证难度，影响 FW 发布节奏 |
+
+### 最优分级策略
+
+根据 flush 规模选择最合适的执行路径：
+
+```
+flush size < 4KB (≤ 16 cachelines):
+    → CPU MMIO 直接写
+      16 × ~200ns = ~3.2 μs，无 CT 往返开销
+      适用：调试路径、同步 readback、小 BO
+
+4KB ≤ flush size < 256KB (16 – 1024 cachelines):
+    → GuC H2G CT 路径
+      1024 × 25ns = ~25 μs（GuC 执行）+ CT ~100 μs = ~125 μs
+      CT 开销可被摊薄，GuC 权限无风险
+
+flush size ≥ 256KB 或 eviction/migration 主路径:
+    → GPU CS LRI batch（若 BSpec 确认 CS 有 MMIO 写权限）
+      18432 × 3ns = ~55 μs，全异步，原生 dma_fence
+    → 或 GuC + HW tag-match flush（若 BSpec 提供 PA 级 flush 接口，最理想）
+```
+
+```mermaid
+flowchart TD
+    A["需要 cache flush/inv\nPA range 大小 = N cachelines"]
+    A --> B{"N < 16?\n(< 4KB)"}
+    B -->|是| C["CPU MMIO 直接循环写\n~3 μs，同步，最低开销"]
+    B -->|否| D{"N < 1024?\n(< 256KB)"}
+    D -->|是| E["GuC H2G CT 路径\n~125 μs，异步 dma_fence\n无权限风险"]
+    D -->|否| F{"CS LRI 权限\n已确认可用?"}
+    F -->|是| G["GPU CS LRI batch\n~55 μs，全异步\n最高吞吐"]
+    F -->|否| H{"HW tag-match flush\n寄存器存在?"}
+    H -->|是| I["GuC + HW tag-match\n< 1 μs，最理想"]
+    H -->|否| J["GuC CT 路径\n（接受较高延迟）"]
+
+    style C fill:#d4edda,stroke:#28a745
+    style E fill:#cce5ff,stroke:#004085
+    style G fill:#d4edda,stroke:#28a745
+    style I fill:#d4edda,stroke:#28a745
+    style J fill:#fff3cd,stroke:#856404
+```
+
+### 结论
+
+**GuC FW 方案在性能上是可行的**（比 CPU MMIO 快 8×，且规避了 CS LRI 的权限不确定性），
+适合作为中等规模 flush 的标准路径。其主要制约是 CT 往返开销（对小 flush 不划算）和 GuC
+单线程串行的固有上限。
+
+**最理想组合**：GuC FW 执行 + HW 提供 **PA 级 tag-match flush 接口**（HW 内部自动
+做 set/way CAM 查找）→ GuC 只需写一个 PA range 命令，HW 完成 ~μs 级精确 flush，同时
+彻底解决 SW 无法预知 way 的问题。这也是 §12.5 关键未解问题 #3 的最优解。
