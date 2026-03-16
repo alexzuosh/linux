@@ -873,3 +873,195 @@ static void xe_hbm_flush_set(struct xe_gt *gt, u32 bank, u32 set,
     val |= CACHE_FLUSH_TRIGGER;
     xe_mmio_write32(gt, CACHE_BANKN_FLUSH_SET(bank), val);
 }
+
+---
+
+## 12.8 Q&A：其他 GPU 厂商如何处理类似的 Cache 维护问题？
+
+> 本节基于 Linux 内核 `drivers/gpu/drm/` 下各厂商驱动源码的实际分析，
+> 并结合公开 ISA/架构文档。
+
+### Q: AMD、NVIDIA、Qualcomm、ARM Mali 等厂商如何处理 GPU cache flush/invalidate？与新 HBM cache 设计有何本质区别？
+
+**A：所有主流 GPU 厂商均通过单条 CS 数据包发出全局 cache 操作，不需要 SW 感知
+bank/set/way 结构。这是与新 HBM cache 设计最核心的架构差异。**
+
+---
+
+### 12.8.1 AMD RDNA3（GFX11）——`ACQUIRE_MEM` + `GCR_CNTL` 数据包
+
+**驱动来源**：`drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c`，
+函数 `gfx_v11_0_emit_mem_sync()`
+
+```c
+/* 实际内核代码（来自 gfx_v11_0.c:6736）*/
+static void gfx_v11_0_emit_mem_sync(struct amdgpu_ring *ring)
+{
+    const unsigned int gcr_cntl =
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_INV(1) |  /* L2 cache (GL2) invalidate */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_WB(1)  |  /* L2 cache writeback        */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_INV(1) |  /* metadata cache invalidate */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_WB(1)  |  /* metadata cache writeback  */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GL1_INV(1) |  /* per-shader-array L1 inv   */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLV_INV(1) |  /* vertex data cache inv     */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_INV(1) |  /* scalar data (K$) inv      */
+        PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(1);   /* instruction cache inv     */
+
+    amdgpu_ring_write(ring, PACKET3(PACKET3_ACQUIRE_MEM, 6));
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_CNTL */
+    amdgpu_ring_write(ring, 0xffffffff);  /* CP_COHER_SIZE    ← 全范围 */
+    amdgpu_ring_write(ring, 0xffffff);    /* CP_COHER_SIZE_HI ← 全范围 */
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE    ← base=0  */
+    amdgpu_ring_write(ring, 0);           /* CP_COHER_BASE_HI */
+    amdgpu_ring_write(ring, 0x0000000A);  /* POLL_INTERVAL */
+    amdgpu_ring_write(ring, gcr_cntl);    /* GCR_CNTL */
+}
+```
+
+**架构特点**：
+- `ACQUIRE_MEM` 数据包**架构上支持 PA range**（`CP_COHER_BASE + CP_COHER_SIZE`）
+- 但驱动实际使用 `BASE=0, SIZE=0xffffffff` → **全局 flush**——无需 SW 知道 PA
+- HW 内部自行确定哪些 cache line 属于该 range，SW 完全不参与 bank/set/way 计算
+- `GCR_CNTL` 各位独立控制多级 cache（GL2/GL1/GLM/GLV/GLK/GLI），精细度高但仍是广播
+
+---
+
+### 12.8.2 Qualcomm Adreno A6xx——`CP_EVENT_WRITE` + CCU flush 事件
+
+**驱动来源**：`drivers/gpu/drm/msm/adreno/a6xx_gpu.c`
+
+```c
+/* 每次 job 提交前：CCU（Color Cache Unit）全局 invalidate */
+OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_DEPTH));
+
+OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(PC_CCU_INVALIDATE_COLOR));
+
+/* job 执行完毕后：CACHE_FLUSH_TS 事件写 fence 值并触发中断 */
+OUT_PKT7(ring, CP_EVENT_WRITE, 4);
+OUT_RING(ring, CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS) | CP_EVENT_WRITE_0_IRQ);
+OUT_RING(ring, lower_32_bits(rbmemptr(ring, fence)));
+OUT_RING(ring, upper_32_bits(rbmemptr(ring, fence)));
+OUT_RING(ring, submit->seqno);
+```
+
+**架构特点**：
+- CCU（Color Cache Unit）是每个 RB（Render Backend）的写合并缓冲区，类似 L1 write buffer
+- `CP_EVENT_WRITE` 事件是**全局广播**，不带任何 PA 地址参数
+- SW 完全无需了解 CCU 内部结构（set/way/bank 等），HW 自动 flush 所有 CCU
+- Adreno 的 L2（UCHE，Unified Command/Constant/Clip/Color/Compute Cache）同样通过
+  `CP_EVENT_WRITE(FLUSH_INVALIDATE_CACHE)` 整体 flush，无 PA range
+
+---
+
+### 12.8.3 NVIDIA Hopper/Ampere（以 Nouveau/CUDA 公开信息为参考）
+
+**NVIDIA 方式**：通过 **PTX `membar` 指令** + **CS SEMAPHORED packet** 处理一致性
+
+```
+# Shader 内：全局内存屏障（等价于 flush 所有 L1/L2 pending write）
+membar.gl;      /* GPU-global scope: 等待所有 prior global writes visible to all SMs */
+membar.sys;     /* System scope:     还包含 CPU 可见性 (NVLink / PCIe flush) */
+
+# Driver CS path：
+# SEMAPHORED packet 中的 RELEASE_WFI=EN 确保 GPU idle 后才写 semaphore
+# 等价于隐式的全局 L2 flush（GPU 内部自动处理）
+```
+
+**架构特点**：
+- NVIDIA L2 cache 对所有 SM **硬件一致**（SM 之间 L2 line 共享，无手动 inv 需求）
+- SW 的工作仅是内存序屏障（`membar`），而非显式 cache maintenance
+- NVIDIA 从不向 KMD 暴露 L2 bank/set/way 结构——完全黑盒
+- CUDA `__threadfence_system()` 扩展到 CPU 可见性（隐含 NVLink/PCIe flush）
+
+---
+
+### 12.8.4 ARM Mali（Panfrost 驱动）
+
+**驱动来源**：`drivers/gpu/drm/panfrost/`
+
+Mali 几乎**不需要显式 GPU cache maintenance**，原因：
+
+```
+Mali GPU → ARM bus interconnect (ACE-Lite / CHI) → ARM CPU LLC
+                     ↑
+              HW 硬件一致性协议
+              Mali L2 cache 参与 ARM coherency domain
+              CPU/GPU 对同一 PA 的访问自动一致
+```
+
+- Mali GPU 使用 ARM **ACE-Lite 总线协议**，GPU L2 自动参与 ARM CPU 的 coherency domain
+- 对于 DMA 操作，使用标准 Linux `dma_sync_*` / IOMMU 维护，不需要 GPU-specific cache ops
+- Panfrost 驱动中唯一的 cache 操作是 **MMU TLB flush**，不涉及 data cache
+
+---
+
+### 12.8.5 各厂商对比汇总
+
+| 维度 | AMD RDNA3 | Qualcomm Adreno | NVIDIA Hopper | ARM Mali | **新 HBM cache 设计** |
+|------|----------|-----------------|---------------|---------|----------------------|
+| **Cache 一致性机制** | SW 显式 CS 数据包 | SW 显式 CS 事件 | HW 一致（L2） | HW 一致（ACE-Lite） | **SW 显式 MMIO 循环** |
+| **flush 接口** | `ACQUIRE_MEM` packet | `CP_EVENT_WRITE` | `membar` 指令 | `dma_sync_*` | **CACHE_BANKN_FLUSH_SET MMIO** |
+| **PA range 支持** | 架构支持（驱动用全局） | 不支持 | 不支持 | 不适用 | **必须按 cacheline 逐一操作** |
+| **SW 需知 bank/set/way** | 否 | 否 | 否 | 否 | **bank+set 需 SW 计算**（way 由 HW 决定） |
+| **单次操作代价** | 1 条 PM4 数据包 | 1 条 PM4 事件 | 1 条 PTX 指令 | 无 | **最坏 18,432 次 MMIO** |
+| **异步 fence 集成** | 原生（PM4 pipeline） | 原生（PM4 pipeline） | 原生（semaphore） | 原生（dma_fence） | **需要额外封装** |
+| **KMD 感知 cache 结构** | 否 | 否 | 否 | 否 | **是（hash 函数必须硬编码）** |
+
+---
+
+### 12.8.6 关键启示：推荐的硬件接口设计方向
+
+从所有主流厂商的实践来看，正确的解决方案是**让 HW 承担 PA→bank/set/way 的映射**，
+SW 只需提供 PA range（或 CS packet 触发全局 flush）：
+
+```
+主流厂商范式（SW 只看 PA，HW 内部做 bank/set/way）：
+
+  SW: ACQUIRE_MEM(PA_base=X, size=N)
+       ↓
+  HW: for each PA in [X, X+N):
+          bank = hash(PA)             ← HW 内部，SW 不可见
+          set  = PA[bits]             ← HW 内部，SW 不可见
+          tag  = PA[tag_bits]         ← HW 内部，SW 不可见
+          for way in 0..7:
+              if cache[bank][set][way].tag == tag:
+                  writeback if dirty
+                  invalidate
+```
+
+**推论**：新 HBM cache 设计如果要对齐业界标准，**最应该提供的 HW 接口是
+PA-range flush CS packet**（类似 AMD `ACQUIRE_MEM` 带精确 range），而不是让
+SW 逐 bank 写 MMIO 寄存器。这样可以：
+
+1. 消除 SW 硬编码 hash 函数的风险
+2. 操作代价从 O(cachelines) 降至 O(1) 个 CS packet
+3. 与 dma_fence 原生集成（CS pipeline 异步执行）
+4. 未来 hash 函数变更不需要修改 KMD
+
+**SW MMIO loop 方案**（当前讨论的路径）应仅作为 HW PA-range packet 不可用时的
+fallback，而非主路径。
+
+```mermaid
+flowchart LR
+    subgraph AMD["AMD RDNA3"]
+        A1["SW: ACQUIRE_MEM\n(PA_base, size)\n1 packet"] --> A2["HW: 内部 bank/set/way\nCAM lookup\n透明"]
+    end
+    subgraph QCOM["Qualcomm Adreno"]
+        Q1["SW: CP_EVENT_WRITE\n(CACHE_FLUSH_TS)\n1 event"] --> Q2["HW: CCU/UCHE\nglobal flush\n透明"]
+    end
+    subgraph NV["NVIDIA"]
+        N1["SW: membar.gl\n1 PTX instruction"] --> N2["HW: L2 coherency\nauto-managed\n完全透明"]
+    end
+    subgraph NEW["新 HBM cache（当前方案）"]
+        X1["SW: 计算 hash\n→ 18432 次 MMIO"] --> X2["HW: 单个 set 操作\n需 SW 驱动循环"]
+    end
+    subgraph IDEAL["新 HBM cache（理想方案）"]
+        I1["SW: 类 ACQUIRE_MEM\n1 CS packet\n(PA_base, size)"] --> I2["HW: 内部 hash+CAM\n透明完成"]
+    end
+
+    style X1 fill:#ffcccc,stroke:#cc0000
+    style X2 fill:#ffcccc,stroke:#cc0000
+    style I1 fill:#d4edda,stroke:#28a745
+    style I2 fill:#d4edda,stroke:#28a745
