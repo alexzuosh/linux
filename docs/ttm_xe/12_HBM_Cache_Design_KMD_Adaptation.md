@@ -759,3 +759,117 @@ flowchart TD
 **最理想组合**：GuC FW 执行 + HW 提供 **PA 级 tag-match flush 接口**（HW 内部自动
 做 set/way CAM 查找）→ GuC 只需写一个 PA range 命令，HW 完成 ~μs 级精确 flush，同时
 彻底解决 SW 无法预知 way 的问题。这也是 §12.5 关键未解问题 #3 的最优解。
+---
+
+## 12.7 Q&A：SW 无法知道 Way——`flush_all_ways` 的设计意义
+
+### Q: Bank 和 Set 可以从 PA 推导，但 Way 无法推导。SW 如何知道一个 PA 是否被缓存？如果被缓存，在哪个 Way？
+
+**A：SW 永远无法知道 Way，也无法知道 PA 是否被缓存。这两个问题都由 `flush_all_ways=1`
+寄存器位在 HW 内部解决——SW 无需知道。**
+
+### 三个地址分量的可知性分析
+
+```
+PA → bank:  hash(PA)            ✓  SW 可计算（须与 BSpec hash 公式完全一致）
+PA → set:   PA[set_high:set_low] ✓  SW 可计算（直接取 PA 的固定 bit 段）
+PA → way:                       ✗  SW 永远不可知
+PA → "是否被缓存":               ✗  SW 同样不可知
+```
+
+**Way 不可知的根本原因**：Way 是在 cacheline 被**加载进 cache 时**，由 HW 替换策略
+（LRU / pseudo-LRU / random）在 8 个 way 中选择一个空闲或最老的 slot 填入的。这个决策
+完全发生在 HW 内部，KMD 不参与，也没有任何接口事后查询。同理，"PA 是否被缓存"等价于
+"某个 way 的 tag 是否等于该 PA 的 tag bits"——仍然只有 HW tag array 知道。
+
+### `flush_all_ways=1` 的本质：set 级别的 HW tag-match 操作
+
+SW 写寄存器时只提供 **(bank, set)**，剩下的 tag 比较和 way 选择完全由 HW 完成：
+
+```
+SW 提供: bank (from hash), set (from PA bits), flush_all_ways=1, trigger=1
+
+HW 内部执行（并行扫描全部 8 ways）:
+  for way in 0..7:
+      tag_stored  = cache_bank[bank].set[set].way[way].tag_bits
+      tag_from_pa = PA[63 : set_high+1]            ← PA 的高位 tag 段
+      if tag_stored == tag_from_pa:                 ← CAM tag 比较
+          if op == FLUSH and dirty_bit[way]:
+              writeback cacheline to HBM            ← 脏数据写回
+          if op == INVALIDATE:
+              mark way[way] as INVALID              ← 清除有效位（不管 dirty）
+          if op == FLUSH_AND_INVALIDATE:
+              writeback if dirty, then mark INVALID
+      else:
+          no-op                                     ← tag 不匹配，跳过
+```
+
+**关键结论**：
+1. **PA 没有被缓存**（8 个 way 全部 tag miss）→ 全部 no-op → **自动正确，零副作用**
+2. **PA 被缓存在某个 way**（恰好一个 way tag match）→ 精确 flush/invalidate 该 way
+3. **SW 完全不需要知道 way**，`flush_all_ways` 本质上是把"查 way"这一步下推到 HW
+
+这正是 `flush_all_ways=1` 的设计意义：**在 set 粒度上做正确的 tag-match，代价仅是
+HW 并行扫描 8 ways**（在 cache 硬件里是极低延迟的并行 CAM 操作，无额外性能开销）。
+
+### 两种 flush 接口的对比
+
+| 接口 | SW 提供 | HW 责任 | Way 可知性要求 |
+|------|---------|---------|--------------|
+| `flush_set_way(bank, set, way)` | (bank, set, **way**) | 直接操作指定 way | SW 必须知道 way ✗ |
+| **`flush_all_ways(bank, set)`** | (bank, set) | **内部 tag-match，选正确 way** | SW 无需知道 way ✓ |
+| `flush_by_pa(PA)` （理想接口） | **完整 PA** | 内部做 hash→bank，取 set bits，tag-match | SW 连 bank/set 都不需要计算 ✓✓ |
+
+`flush_all_ways` 是现有寄存器接口下的最优方案。`flush_by_pa` 是 §12.5 未解问题 #3
+（tag-match flush）的理想形态——如果 BSpec 提供此接口，SW 只需传 PA，HW 完全自主。
+
+### 对正确性的影响：多余的 way 扫描是否有问题？
+
+```
+一个 set 有 8 ways，PA 只在其中一个 way（或根本不在）：
+  - 匹配的 way（0或1个）: 执行 flush/invalidate → 正确
+  - 不匹配的 7 ways: tag 比较失败 → no-op → 正确
+  - 脏的不匹配 way: tag 不同 → 跳过 → 正确（属于其他 PA，不能动）
+```
+
+**`flush_all_ways` 是幂等且无副作用的**：它只操作 tag 精确匹配的 way，
+其他 way 的数据完全不受影响。反复调用同一 (bank, set) 的结果与调用一次相同。
+
+### 实现简化
+
+这一分析的重要推论：§12.5 中的 `xe_hbm_flush_set()` 实现**不需要任何 way 参数**，
+始终使用 `flush_all_ways=1`，这是正确且唯一可行的 SW 接口：
+
+```c
+/*
+ * xe_hbm_flush_set - flush/invalidate a cache set across all ways
+ *
+ * SW cannot determine which way a PA occupies (way is assigned by HW
+ * replacement policy at load time, not derivable from PA).
+ * Setting CACHE_FLUSH_ALL_WAYS delegates tag comparison to HW:
+ *   - HW scans all 8 ways in parallel
+ *   - Only the way whose tag matches PA[tag_bits] is flushed/invalidated
+ *   - Non-matching ways are silently skipped (no side effects)
+ *   - If PA is not cached (all ways miss), the operation is a no-op
+ *
+ * This is correct, safe, and the only viable approach for SW-managed flush.
+ *
+ * @gt:   GT instance
+ * @bank: cache bank index (0–143), derived from xe_hbm_bank_hash(PA)
+ * @set:  set index (0–127), derived from PA[set_high:set_low]
+ * @op:   XE_HBM_FLUSH, XE_HBM_INVALIDATE, or XE_HBM_FLUSH_AND_INVALIDATE
+ */
+static void xe_hbm_flush_set(struct xe_gt *gt, u32 bank, u32 set,
+                              enum xe_hbm_cache_op op)
+{
+    u32 val = FIELD_PREP(CACHE_SET_INDEX, set) |
+              CACHE_FLUSH_ALL_WAYS;   /* always: SW cannot know the way */
+
+    if (op == XE_HBM_FLUSH || op == XE_HBM_FLUSH_AND_INVALIDATE)
+        val |= CACHE_OP_FLUSH;
+    if (op == XE_HBM_INVALIDATE || op == XE_HBM_FLUSH_AND_INVALIDATE)
+        val |= CACHE_OP_INVALIDATE;
+
+    val |= CACHE_FLUSH_TRIGGER;
+    xe_mmio_write32(gt, CACHE_BANKN_FLUSH_SET(bank), val);
+}
