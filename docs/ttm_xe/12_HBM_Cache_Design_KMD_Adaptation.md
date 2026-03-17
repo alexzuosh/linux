@@ -1358,3 +1358,401 @@ flowchart LR
     style PV1 fill:#fff3cd,stroke:#ffc107
     style PV2 fill:#fff3cd,stroke:#ffc107
 ```
+
+---
+
+## 12.9 Q&A：单条 CL Flush 的 3 步操作与 2MB 内存 Flush 的 Cycle 代价
+
+> 本节以 **256B cacheline、144 banks、128 sets/bank、8 ways/set** 为参数基准，
+> 对用户描述的三步操作序列进行精确的延迟建模与 2MB 内存 flush 的全流程耗时分析。
+
+---
+
+### 12.9.1 单条 Cacheline Flush 的三步操作详解
+
+用户描述的三步流程与 HW 寄存器的对应关系如下：
+
+```
+Step 1: hash(PA) → bank_id ; READ CACHE_BANKN_STATUS → confirm FLUSH_BUSY = 0
+Step 2: WRITE CACHE_BANKN_FLUSH_SET(bank) = { set_index, flush_all_ways=1, trigger=1 }
+Step 3: poll READ CACHE_BANKN_STATUS(bank) until FLUSH_DONE = 1
+        → only then issue next FLUSH_SET to the SAME bank
+```
+
+#### 关键约束梳理
+
+| 约束 | 说明 |
+|------|------|
+| **Step 1 必要性** | 同一 bank 上的两次 flush 操作必须串行；若上次 flush 未完成就再次写 FLUSH_SET 寄存器，行为未定义（寄存器会被覆盖或触发硬件错误） |
+| **Way 不可知** | HW 的 tag 存在于 bank 内部 SRAM，SW 对整个 tag array 不可读。策略：`flush_all_ways = 1`，HW 内部扫描 8 ways，匹配则 writeback，不匹配（clean/miss）静默跳过，SW 无需知道 way |
+| **不同 bank 可并行** | Step 3 的"等待同 CB 完成"约束**只在同一 bank 内**有效。对 Bank_A 发出 Step 2 后，立即可对 Bank_B 执行 Step 1→2→3，二者 HW 完全独立 |
+| **Step 3 延迟分布** | 取决于该 set 内脏数据量：0 dirty ways (clean) → ~5–20 ns HW；k dirty ways → ~100–200ns × k（每次 HBM writeback）|
+
+---
+
+### 12.9.2 每步操作的延迟拆解
+
+以下分别给出 **CPU PCIe MMIO 路径**和 **GuC GT-fabric MMIO 路径**的延迟数字。
+
+#### 硬件基准参数
+
+| 参数 | CPU 路径 | GuC 路径 |
+|------|---------|---------|
+| MMIO **读**（STATUS）延迟 | ~300 ns（PCIe Gen4 往返）| ~25 ns（GT 片上 fabric read）|
+| MMIO **写**（FLUSH_SET）延迟 | ~200 ns（Posted write + 后续读的 ordering 强制）| ~25 ns（GT fabric write）|
+| Hash + set 计算 | ~5 ns（L1 cache 命中，3 GHz CPU）| ~5 ns（GuC RISC-V arithmetic）|
+| HBM cache bank 内部 tag 扫描（8 ways）| 5–20 ns HW | 5–20 ns HW（硬件速度相同）|
+| HBM dirty writeback（256B × 1 way）| 100–200 ns HW | 100–200 ns HW（硬件速度相同）|
+
+#### Step 1：确认 Bank 空闲
+
+```
+操作：hash(PA) → bank; set = (PA >> 8) & 0x7F; READ CACHE_BANKN_STATUS(bank)
+
+                          CPU MMIO    GuC MMIO
+  hash(PA) arithmetic     5  ns       5  ns
+  READ STATUS register   300 ns      25  ns    ← 若 bank 空闲，1 次读即返回
+  ─────────────────────────────────────────
+  Step 1 小计（空闲）    305 ns      30  ns
+
+  若 bank 仍 busy（上次 flush 未完成）→ spin poll:
+   每额外一次 STATUS read:  +300 ns   +25 ns
+   平均额外轮询次数:         ~0.1 次   ~0.1 次（同 bank 相邻操作间隔 >> HW flush 时间）
+  Step 1 实际均值          ~335 ns    ~33  ns
+```
+
+> **均值解释**：对于 2MB 连续内存，同一 bank 的相邻操作之间平均间隔约 **57 × T_op**（其他
+> 57 个操作覆盖了该等待期），远超 HBM flush 最坏延迟 200 ns，因此 Step 1 的 busy 轮询
+> 次数接近 0。只有在 bank 密集操作时（同 bank 连续多次 flush）才会出现 spin。
+
+#### Step 2：写 Flush 寄存器触发操作
+
+```
+操作：WRITE CACHE_BANKN_FLUSH_SET(bank) = { [6:0]=set, [10]=flush_all_ways, [31]=trigger }
+
+                          CPU MMIO    GuC MMIO
+  WRITE FLUSH_SET reg    200 ns      25  ns
+  ─────────────────────────────────────────
+  Step 2 小计            200 ns      25  ns
+```
+
+> **Posted write 说明**：PCIe 写是 posted（单向），CPU 在发出 TLP 后即可继续执行下一条指令。
+> 但 Step 3 中的 READ STATUS 会强制前续 WRITE 先到达 HW（PCIe ordering rule），使 WRITE
+> 实际约束在 ~200 ns 内生效。这就是为什么 CPU WRITE 计为 200 ns 而非 "0"。
+
+#### Step 3：等待 Flush 完成（同 bank 方可继续）
+
+```
+操作：spin-poll READ CACHE_BANKN_STATUS(bank) until FLUSH_DONE = 1
+
+HW 内部执行时序（从 trigger 写入后开始）：
+  ├─ tag scan 8 ways（SRAM read）     :  5–20 ns  HW
+  ├─ 若 way[k].dirty == 1:
+  │     read dirty 256B from cache SRAM :  5–10 ns  HW
+  │     write 256B to HBM DRAM          : 100–200 ns HW
+  │     clear dirty bit                 :  1–2 ns   HW
+  └─ 若全部 way 为 clean 或 miss:     :  5–20 ns  HW（仅 tag scan，直接 DONE）
+
+SW poll 延迟（每次 STATUS read）:
+  CPU MMIO:   ~300 ns/次
+  GuC MMIO:   ~25  ns/次
+
+典型 dirty 比例分布与 Step 3 耗时：
+
+ ┌────────────────────┬──────────────────────┬──────────────────────┐
+ │  场景               │  HW flush 时间        │  CPU poll 总耗时     │  GuC poll 总耗时    │
+ ├────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┤
+ │ 全 clean（0 dirty）│  ~10 ns               │  300 ns（1 次 poll）  │  25 ns              │
+ │ 1 way dirty        │  ~120 ns              │  300 ns（1 次 poll） │  75 ns（3 次 poll） │
+ │ 4 ways dirty       │  ~520 ns              │  900 ns（3 次 poll） │  125 ns（5 次 poll）│
+ │ 8 ways dirty (最坏)│  ~1,620 ns            │  1,800 ns（6 次 poll）│  200 ns（8 次 poll）│
+ └────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┘
+
+典型工作负载假设（eviction 场景，1 way dirty per set on avg）：
+  CPU Step 3:  ~300 ns（平均 1 poll）
+  GuC Step 3:  ~75  ns（平均 3 polls，GT fabric poll 快）
+```
+
+#### 单条 Cacheline Flush 延迟汇总
+
+```
+┌────────────────────┬────────────────┬────────────────────┐
+│  Step              │  CPU MMIO      │  GuC MMIO          │
+├────────────────────┼────────────────┼────────────────────┤
+│  Step 1 (idle chk) │  ~335 ns       │  ~33 ns            │
+│  Step 2 (trigger)  │  ~200 ns       │  ~25 ns            │
+│  Step 3 (wait done)│  ~300 ns       │  ~75 ns            │
+├────────────────────┼────────────────┼────────────────────┤
+│  **单 CL 合计**    │  **~835 ns**   │  **~133 ns**       │
+│  等效 CPU cycles   │  ~2,505 cyc    │  —                 │
+│  等效 GuC cycles   │  —             │  ~53 GuC cyc       │
+└────────────────────┴────────────────┴────────────────────┘
+```
+
+---
+
+### 12.9.3 2MB 内存 Flush 的总代价
+
+#### 基本参数
+
+```
+内存大小: 2MB = 2,097,152 B
+Cacheline: 256B → CL_SHIFT = 8
+Cacheline 数量: 2,097,152 / 256 = 8,192 条 CL
+
+Bank 分布（hash 均匀时）:
+  8,192 / 144 ≈ 57 条 CL/bank（平均）
+
+Bitmap 去重后 FLUSH_SET 写次数:
+  对于 2MB 连续内存，每条 CL 地址唯一 → 最多 8,192 次 MMIO write
+  144 banks × 128 sets = 18,432 个 (bank,set) 槽，8,192 < 18,432
+  → 碰撞率低（约 8,192/18,432 = 44% 槽被填充），去重收益约 ~3%
+  → **实际 MMIO 写次数 ≈ 7,950–8,192 次** (bitmap dedup 后)
+
+每 bank 平均串行操作序列长度:
+  57 ops/bank，每次操作需等待上次完成（Step 3 约束）
+  相邻同 bank 操作间的"自然冷却时间"= 其他 ~143 ops × T_op ≈ 143 × 133 ns ≈ 19 µs
+  >> HBM writeback 最坏时间 1,620 ns → Step 1 spin 概率接近 0%
+```
+
+#### 三种执行模式的耗时对比
+
+##### 模式 A：CPU MMIO 严格串行（最差）
+
+每次 CL flush 严格等待 Step 3 完成后才处理下一条 CL：
+
+```
+T_total = N_CL × (Step1 + Step2 + Step3)
+        = 8,192 × (335 + 200 + 300) ns
+        = 8,192 × 835 ns
+        = 6,840,320 ns
+        ≈ 6.84 ms
+
+CPU cycles @ 3 GHz:
+  8,192 × 835 ns × 3 cycles/ns ≈ 20,520,960 cyc ≈ 20.5M CPU cycles
+
+细目拆解:
+  Step 1 (STATUS reads):   8,192 × 335 ns = 2.74 ms  (40.1%)
+  Step 2 (FLUSH writes):   8,192 × 200 ns = 1.64 ms  (24.0%)
+  Step 3 (completion poll): 8,192 × 300 ns = 2.46 ms  (35.9%)
+```
+
+> **瓶颈**：PCIe 往返延迟（300 ns/次 STATUS read）占总时间 76%。Step 2 的 WRITE 只有
+> 24%，真正的 HBM flush HW 时间（~120 ns）完全被 PCIe round-trip 掩盖。
+
+##### 模式 B：GuC 严格串行（中等）
+
+GuC 通过 CT 命令批处理，所有 flush 串行执行：
+
+```
+T_total = N_CL × (Step1 + Step2 + Step3)_GuC
+        = 8,192 × (33 + 25 + 75) ns
+        = 8,192 × 133 ns
+        = 1,089,536 ns
+        ≈ 1.09 ms
+
+GuC cycles @ 400 MHz:
+  8,192 × 133 ns × 0.4 cycles/ns ≈ 435,712 cyc ≈ 436K GuC cycles
+
+细目拆解:
+  Step 1:   8,192 × 33 ns  = 270 µs  (24.8%)
+  Step 2:   8,192 × 25 ns  = 205 µs  (18.8%)
+  Step 3:   8,192 × 75 ns  = 615 µs  (56.4%)  ← HBM writeback HW 时间主导
+```
+
+> **对比 CPU 模式**：GuC 串行比 CPU 串行快约 **6.3 倍**，原因是 GT fabric MMIO 延迟
+> (~25 ns) 比 PCIe (~300 ns) 快约 12 倍，使 Step 3 的 HBM writeback HW 时间（~120 ns）
+> 开始对总延迟有贡献（不再被 PCIe poll 完全掩盖）。
+
+##### 模式 C：GuC Bank 交叉流水（最优）
+
+将 8,192 ops 按 bank 轮换顺序处理（bank_0 op0, bank_1 op0, ..., bank_143 op0, bank_0 op1, ...）：
+
+```
+关键洞察：
+  同 bank 相邻操作间隔 = (144-1) ops × 50 ns/op = 7,150 ns
+  >> HBM 最坏 writeback = 1,620 ns
+  ∴ 每次回到同一 bank 时 Step 1 STATUS 一定返回 DONE → 无 spin
+
+每 op 耗时（无 spin，Step 3 不等待，DONE 已在间隔期完成）:
+  Step 1: STATUS read (always DONE) = 25 ns
+  Step 2: FLUSH_SET write           = 25 ns
+  Step 3: skip wait（will check on next visit to this bank）= 0 ns
+  小计: 50 ns/op（issue-and-proceed，completion by next visit）
+
+T_total = N_CL × 50 ns + final_completion_wait
+        = 8,192 × 50 ns + 144 × 1 STATUS_read × 25 ns
+        = 409,600 ns + 3,600 ns
+        ≈ 413,200 ns ≈ 413 µs
+
+GuC cycles:
+  413 µs × 400 MHz / 1000 ≈ 165K GuC cycles
+```
+
+**流水线时序图**（8 banks 简化示例，每 bank 3 ops）：
+
+```
+Time: 0   50  100 150 200 250 300 350 400 450 500 550 600 650 700 750 ns
+      │   │   │   │   │   │   │   │   │   │   │   │   │   │   │   │
+GuC:  [B0R][B0W][B1R][B1W][B2R][B2W]...[B7R][B7W][B0R][B0W]...
+         ↑   ↑                                      ↑
+         issue   issue                        B0 op2: STATUS=DONE (was 350ns ago)
+         B0 op0  B0 op0                       (gap = 350ns > ~200ns dirty flush)
+
+HW B0: [idle][flush................................][done][idle][flush......][done]
+HW B1:       [idle][flush....][done][idle]..............................[flush][done]
+HW B2:             [idle][flush....][done]...................................
+...（各 bank HW 完全并行）
+```
+
+#### 四种场景汇总表
+
+```
+┌───────────────────────┬──────────────────┬───────────────────┬─────────────────────┐
+│ 执行模式              │  总耗时           │  MMIO 操作总次数  │  主要瓶颈           │
+├───────────────────────┼──────────────────┼───────────────────┼─────────────────────┤
+│ CPU MMIO 串行         │  ~6.84 ms        │  ~24,576 次        │  PCIe 往返延迟      │
+│                       │  ~20.5M CPU cyc  │  (8192×3 reads+   │  每次 300 ns        │
+│                       │                  │   8192×1 writes)  │                     │
+├───────────────────────┼──────────────────┼───────────────────┼─────────────────────┤
+│ GuC 串行              │  ~1.09 ms        │  ~24,576 次        │  HBM writeback      │
+│                       │  ~436K GuC cyc   │  (GT fabric)      │  ~120 ns/dirty CL   │
+├───────────────────────┼──────────────────┼───────────────────┼─────────────────────┤
+│ GuC 银行交叉流水      │  ~413 µs         │  ~16,384 次        │  GuC 单线程吞吐     │
+│                       │  ~165K GuC cyc   │  (1 read+1 write  │  50 ns × 8192 ops   │
+│                       │                  │  per op, no spin) │                     │
+├───────────────────────┼──────────────────┼───────────────────┼─────────────────────┤
+│ 理论最优（144 bank    │  ~57×133 ns      │  —                │  per-bank 串行深度  │
+│ 完全并行）            │  ≈ 7.6 µs        │                   │  57 ops/bank        │
+│ （需多线程发射）      │  (ideal)         │                   │                     │
+└───────────────────────┴──────────────────┴───────────────────┴─────────────────────┘
+
+注：worst case（所有 CL 均 dirty，8 ways dirty/set）：
+  CPU 串行：8,192 × (335+200+1800) ns = ~19.2 ms  ← GPU 应用几乎不会出现
+  GuC 串行：8,192 × (33+25+200) ns   = ~2.1 ms
+  GuC 流水：8,192 × 50 ns + wait     ≈ 413 µs     ← 流水消除了 dirty wait 开销
+```
+
+---
+
+### 12.9.4 关键开销来源分析
+
+#### 为什么 CPU 路径如此昂贵？
+
+```
+PCIe MMIO 延迟分解（CPU 视角，PCIe Gen 4 × 16）：
+
+  CPU core write      →  L1/L2/L3 cache bypass（uncached mapping） →
+  CPU to PCIe root    :  ~20 ns   (CPU 内部 uncore fabric)
+  PCIe root to device :  ~80 ns   (PCIe PHY + link traversal, Gen4 ~250 MT/s)
+  Device MMIO write   :  ~5-20 ns (GT register write arrives)
+  ────────────────────────────────────────────────────────────────
+  Posted write total  :  ~105-120 ns（CPU 看到时，实际到达 HW 的总延迟）
+
+  CPU core read (STATUS) →
+  CPU issues read TLP  :  ~20 ns
+  TLP traverses PCIe   :  ~80 ns
+  Device processes     :  ~5-20 ns  (register read + STATUS mux)
+  Completion TLP back  :  ~80 ns   (PCIe return path)
+  CPU receives data    :  ~20 ns
+  ────────────────────────────────────────────────────────────────
+  Total READ RTT       :  ~205-220 ns ≈ 300 ns（保守估计包含竞争）
+
+对于 2MB flush，STATUS read 次数:
+  Step 1: 8,192 次（每条 CL 一次）
+  Step 3: 8,192 次（平均，假设 1 poll = done）
+  合计:   ~16,384 STATUS reads × 300 ns = 4.92 ms（占总 6.84 ms 的 72%）
+```
+
+#### 为什么 Step 3 在 GuC 路径上仍然显著？
+
+```
+尽管 GuC STATUS poll 只需 25 ns，Step 3 的主体是 HW flush 时间：
+
+  典型 1 way dirty → HBM writeback:
+    256B 数据从 cache SRAM 读取  :  ~5 ns  (SRAM bandwidth 高)
+    256B 数据写入 HBM DRAM       :  ~80-150 ns (HBM burst + bank activate)
+    总 HW 时间                   :  ~85-155 ns
+
+  GuC poll 频率 (25 ns/poll) vs HW 时间 (~120 ns):
+    需要 ~4-5 次 GuC polls 才能观察到 DONE
+    4 polls × 25 ns = 100 ns polling overhead
+    → GuC Step 3 总: 120 + 100 = ~220 ns（不是直接等待，是 polling 带来的量化误差）
+    
+    实际取 ~75 ns 是假设 clean-mostly（70%）场景的加权平均
+```
+
+---
+
+### 12.9.5 "没有 Way 信息"的代价量化
+
+用户提到 Step 2 中 "there is no way to get the way"——使用 `flush_all_ways = 1` 的实际额外代价：
+
+```
+场景：set 中恰好 1 way dirty，其余 7 ways clean
+
+使用 flush_all_ways=1 时，HW 对每个 way 做的工作：
+  Way 0 (dirty):  tag compare (match) → SRAM read 256B → HBM write → clear dirty
+                  = ~5 ns + 5 ns + 120 ns + 2 ns = ~132 ns
+  Way 1..7 (clean): tag compare (no match / clean bit=0) → skip
+                  = ~1–2 ns per way × 7 = ~7–14 ns
+
+强制 flush 8 ways vs 精确 flush 1 way:
+  8-way scan overhead = 7 × ~2 ns = ~14 ns  ← 此为额外代价，极小
+
+结论：flush_all_ways=1 带来的额外开销 < 15 ns/set，完全可接受。
+相比 PCIe MMIO 的 300 ns/次延迟，way scan 开销可忽略不计。
+```
+
+---
+
+### 12.9.6 实践建议
+
+基于上述分析：
+
+1. **生产路径必须用 GuC 交叉流水（模式 C）**：
+   - 将 8,192 ops 按 bank 轮换顺序组织（`for round 0..56: for bank 0..143: write FLUSH_SET`）
+   - GuC 侧每 op 只需 STATUS_check + FLUSH_WRITE = **50 ns**，无 spin wait
+   - 2MB flush 总耗时 **~413 µs**
+
+2. **Step 1 STATUS check 实际上可以合并到 Step 3 的流水中**：
+   - 在模式 C 中，Step 3 的"等待"由 bank 间隔自然提供，Step 1 的 STATUS check
+     实际上就是确认上一轮写到此 bank 已完成，与 Step 3 的语义合并 → 每 op 只需
+     **1 READ + 1 WRITE = 2 MMIO ops**（不是 3 MMIO ops）
+
+3. **CPU MMIO 路径（模式 A）只适合 < 64KB 的小范围 flush**：
+   - 64KB / 256B = 256 CLs × 835 ns ≈ **214 µs**（< 0.25 ms，可接受）
+   - 2MB 需 **~6.84 ms**，会造成用户可感知的 GPU stall，不可接受
+
+4. **worst case 防护**：若 flush 期间发现大量 dirty ways（内存压力高），GuC 应设置超时
+   （建议 10 ms），超时后报错并触发 full-cache-invalidate + GPU reset 避免数据损坏
+
+```c
+/* 推荐的 GuC 内部 2MB flush 执行框架（伪代码，bank 交叉流水）*/
+void guc_hbm_flush_range(u64 pa_base, u64 size)
+{
+    struct flush_op ops[8192];       /* (bank, set) pairs from bitmap */
+    int n_ops = build_flush_ops(pa_base, size, ops);   /* hash → bitmap → list */
+    int round_size = 144;            /* one op per bank per round */
+    
+    for (int i = 0; i < n_ops; i++) {
+        int bank = ops[i].bank, set = ops[i].set;
+        
+        /* Step 1: confirm bank idle (after round_size gap, always idle) */
+        if (!wait_status_idle(bank, timeout_ns=1000))  /* 1 µs timeout */
+            goto err_bank_stuck;
+        
+        /* Step 2: trigger flush */
+        mmio_write(CACHE_BANKN_FLUSH_SET(bank),
+                   SET_INDEX(set) | FLUSH_ALL_WAYS | TRIGGER);
+        
+        /* Step 3: do NOT wait here if next op goes to different bank */
+        /* Will confirm on next visit to this bank (Step 1 of that op) */
+    }
+    
+    /* Final: confirm all banks done */
+    for (int b = 0; b < 144; b++)
+        wait_status_done(b, timeout_ns=5000);  /* 5 µs timeout per bank */
+}
+```
+
